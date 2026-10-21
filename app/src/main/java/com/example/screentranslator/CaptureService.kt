@@ -38,7 +38,7 @@ class CaptureService : Service() {
         mode = intent?.getStringExtra("mode") ?: "Окно"
         val data = if(Build.VERSION.SDK_INT >= 33) intent?.getParcelableExtra("data",Intent::class.java) else @Suppress("DEPRECATION") intent?.getParcelableExtra<Intent>("data")
         if (data == null) { stopSelf(); return START_NOT_STICKY }
-        projection = getSystemService(MediaProjectionManager::class.java).getMediaProjection(intent.getIntExtra("resultCode", Activity.RESULT_CANCELED),data)
+        projection = getSystemService(MediaProjectionManager::class.java).getMediaProjection(intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED, data)
         projection?.registerCallback(object: MediaProjection.Callback() { override fun onStop() { handler.post { stopSelf() } } },handler)
         val metrics = resources.displayMetrics
         reader = ImageReader.newInstance(metrics.widthPixels,metrics.heightPixels,android.graphics.PixelFormat.RGBA_8888,2)
