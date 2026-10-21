@@ -17,7 +17,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32,48,32,32) }
-        root.addView(TextView(this).apply { text = "Screen Translator v0.3"; textSize = 25f })
+        root.addView(TextView(this).apply { text = "Screen Translator v0.4"; textSize = 25f })
         root.addView(TextView(this).apply { text = "Перевод с экрана без рекламы. Китайский → Русский.\nМодель перевода скачивается отдельно после установки."; textSize = 16f })
         val choices = arrayOf("Окно", "Поверх текста (экспериментально)")
         root.addView(Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, choices); onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
