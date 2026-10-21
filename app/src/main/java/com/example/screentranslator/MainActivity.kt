@@ -17,8 +17,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 36, 28, 24) }
         val scroll = ScrollView(this).apply { addView(root) }
-        root.addView(TextView(this).apply { text = "Screen Translator v0.5"; textSize = 24f })
-        root.addView(TextView(this).apply { text = "Автоопределение языка → Русский. Основной режим — поверх текста."; textSize = 15f })
+        root.addView(TextView(this).apply { text = "Screen Translator v0.6"; textSize = 24f })
+        root.addView(TextView(this).apply { text = "Перевод поверх текста. TR: одно нажатие — весь экран, двойное — выделение области."; textSize = 15f })
         fun spinner(title: String, items: Array<String>, key: String, default: Int) {
             root.addView(TextView(this).apply { text = title; textSize = 16f; setPadding(0, 18, 0, 0) })
             val sp = Spinner(this)
@@ -33,7 +33,43 @@ class MainActivity : Activity() {
             root.addView(sp)
         }
         spinner("Режим отображения", arrayOf("Поверх текста", "Отдельное окно"), "mode", 0)
-        spinner("Область перевода", arrayOf("Весь экран", "Выделить область"), "area", 0)
+        spinner("Переводчик", arrayOf("Офлайн ML Kit", "Google Cloud Translation API", "Baidu Translate API"), "provider", 0)
+        val languageNames = arrayOf("Авто", "Китайский", "Английский", "Японский", "Корейский", "Русский")
+        val targetNames = arrayOf("Русский", "Китайский", "Английский", "Японский", "Корейский")
+        spinner("Язык оригинала", languageNames, "source", 0)
+        spinner("Язык перевода", targetNames, "target", 0)
+        root.addView(Button(this).apply { text = "⇄ Поменять языки местами"; setOnClickListener {
+            val s = prefs.getInt("source", 0)
+            val t = prefs.getInt("target", 0)
+            // Target indexes: ru, zh, en, ja, ko; source: auto, zh, en, ja, ko, ru
+            val newSource = intArrayOf(5,1,2,3,4)[t.coerceIn(0,4)]
+            val newTarget = when(s) { 1->1; 2->2; 3->3; 4->4; 5->0; else->1 }
+            prefs.edit().putInt("source", newSource).putInt("target", newTarget).apply()
+            recreate()
+        } })
+        fun credential(label: String, key: String) {
+            root.addView(TextView(this).apply { text = label; textSize = 14f })
+            val input = EditText(this).apply {
+                setSingleLine(true)
+                setText(prefs.getString(key, ""))
+                hint = label
+            }
+            root.addView(input)
+            input.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) prefs.edit().putString(key, input.text.toString().trim()).apply()
+            }
+            root.addView(Button(this).apply { text = "Сохранить $label"; setOnClickListener {
+                prefs.edit().putString(key, input.text.toString().trim()).apply()
+                Toast.makeText(this@MainActivity, "Сохранено локально", Toast.LENGTH_SHORT).show()
+            } })
+        }
+        root.addView(TextView(this).apply {
+            text = "Онлайн-перевод требует собственных ключей API провайдера. Google Cloud Translation API и Baidu API могут быть платными. Ключи хранятся в настройках телефона."
+            textSize = 13f
+        })
+        credential("Google Cloud API key", "google_key")
+        credential("Baidu App ID", "baidu_appid")
+        credential("Baidu Secret", "baidu_secret")
         spinner("Цвет перевода", arrayOf("Чёрный текст / белый фон", "Белый текст / чёрный фон"), "theme", 0)
         root.addView(TextView(this).apply { text = "Размер текста"; textSize = 16f; setPadding(0, 18, 0, 0) })
         val sizeLabel = TextView(this)
@@ -64,7 +100,7 @@ class MainActivity : Activity() {
             startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), requestCapture)
         } })
         root.addView(Button(this).apply { text = "Остановить"; setOnClickListener { stopService(Intent(this@MainActivity, CaptureService::class.java)) } })
-        root.addView(TextView(this).apply { text = "Нажмите плавающую TR для перевода. В режиме области обведите нужный участок пальцем. Нажатие на перевод скрывает его."; textSize = 14f })
+        root.addView(TextView(this).apply { text = "TR: одно нажатие переводит экран. Двойное быстрое нажатие включает выделение области. Нажатие на перевод скрывает его."; textSize = 14f })
         setContentView(scroll)
     }
     @Deprecated("Legacy result API")

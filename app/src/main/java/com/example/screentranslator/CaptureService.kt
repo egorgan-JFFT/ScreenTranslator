@@ -21,6 +21,12 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.*
 import kotlin.math.*
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.concurrent.Executors
+import org.json.JSONObject
 
 class CaptureService : Service() {
     private lateinit var wm: WindowManager
@@ -31,6 +37,42 @@ class CaptureService : Service() {
     private var resultOverlay: View? = null
     private var selectingOverlay: View? = null
     private var busy = false
+    private var regionMode = false
+    private var pendingTap: Runnable? = null
+    private var lastTap = 0L
+    private val network = Executors.newSingleThreadExecutor()
+    private val languageCodes = arrayOf("ru", "zh", "en", "ja", "ko")
+    private fun selectedTarget(): String = languageCodes[prefs.getInt("target",0).coerceIn(0,4)]
+    private fun selectedSource(): String? = when (prefs.getInt("source",0)) {
+        1 -> "zh"; 2 -> "en"; 3 -> "ja"; 4 -> "ko"; 5 -> "ru"; else -> null
+    }
+    private fun normalized(code: String): String = when {
+        code.startsWith("zh") -> "zh"
+        code.startsWith("ja") -> "ja"
+        code.startsWith("ko") -> "ko"
+        code.startsWith("ru") -> "ru"
+        code.startsWith("en") -> "en"
+        else -> if (code == "und") "zh" else code
+    }
+    private fun onBubbleTap() {
+        if (busy) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastTap < 330L) {
+            pendingTap?.let { handler.removeCallbacks(it) }
+            pendingTap = null
+            lastTap = 0L
+            regionMode = !regionMode
+            Toast.makeText(this, if (regionMode) "Режим: выделить область" else "Режим: весь экран", Toast.LENGTH_SHORT).show()
+        } else {
+            lastTap = now
+            val action = Runnable {
+                pendingTap = null
+                if (!busy) { dismissResult(); if (regionMode) selectRegion() else capture(null) }
+            }
+            pendingTap = action
+            handler.postDelayed(action, 340L)
+        }
+    }
     private val handler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private val languageId = LanguageIdentification.getClient()
@@ -71,10 +113,7 @@ class CaptureService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT).apply { this.gravity = gravity }
     private fun showBubble() {
-        val button = Button(this).apply { text = "TR"; setOnClickListener { if (!busy) {
-            dismissResult()
-            if (prefs.getInt("area", 0) == 1) selectRegion() else capture(null)
-        } } }
+        val button = Button(this).apply { text = "TR"; setOnClickListener { onBubbleTap() } }
         val p = params(145, 115).apply { x = 0; y = 220 }
         button.setOnTouchListener(object : View.OnTouchListener {
             var downX = 0f; var downY = 0f; var oldX = 0; var oldY = 0; var moved = false
@@ -175,34 +214,82 @@ class CaptureService : Service() {
     }
     private fun translateAll(items: List<Segment>) {
         val translated = mutableListOf<Pair<Rect,String>>()
+        val target = selectedTarget()
+        val provider = prefs.getInt("provider",0)
         fun next(i: Int) {
-            if (i >= items.size) { busy=false;showResult(translated);return }
-            val item=items[i]
-            languageId.identifyLanguage(item.text).addOnSuccessListener { detected ->
-                val source = when (detected) {
-                    "zh", "zh-CN", "zh-TW" -> TranslateLanguage.CHINESE
-                    "ja" -> TranslateLanguage.JAPANESE
-                    "ko" -> TranslateLanguage.KOREAN
-                    "en" -> TranslateLanguage.ENGLISH
-                    "ru" -> TranslateLanguage.RUSSIAN
-                    else -> if (item.text.any { it.code in 0x4E00..0x9FFF }) TranslateLanguage.CHINESE else TranslateLanguage.ENGLISH
+            if (i >= items.size) { busy=false; showResult(translated); return }
+            val item = items[i]
+            fun translate(source: String) {
+                if (source == target) { next(i+1); return }
+                if (provider == 0) {
+                    val client = translators.getOrPut("$source:$target") {
+                        Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source)
+                            .setTargetLanguage(target).build())
+                    }
+                    client.downloadModelIfNeeded().addOnSuccessListener {
+                        client.translate(item.text).addOnSuccessListener { result ->
+                            translated.add(item.rect to result); next(i+1)
+                        }.addOnFailureListener { next(i+1) }
+                    }.addOnFailureListener { e ->
+                        Toast.makeText(this,"Модель: ${e.localizedMessage}",Toast.LENGTH_LONG).show()
+                        next(i+1)
+                    }
+                } else {
+                    network.execute {
+                        val result = try { onlineTranslate(provider, item.text, source, target) }
+                                     catch (e: Exception) { android.util.Log.e("ScreenTranslator", "Online translation failed", e); null }
+                        handler.post {
+                            if (result != null) translated.add(item.rect to result)
+                            else Toast.makeText(this, "Ошибка онлайн-перевода. Проверьте ключ API и сеть", Toast.LENGTH_LONG).show()
+                            next(i+1)
+                        }
+                    }
                 }
-                if (source == TranslateLanguage.RUSSIAN) { next(i+1);return@addOnSuccessListener }
-                val translator = translators.getOrPut(source) {
-                    Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source)
-                        .setTargetLanguage(TranslateLanguage.RUSSIAN).build())
-                }
-                translator.downloadModelIfNeeded().addOnSuccessListener {
-                    translator.translate(item.text).addOnSuccessListener { text ->
-                        translated.add(Pair(item.rect,text));next(i+1)
-                    }.addOnFailureListener { next(i+1) }
-                }.addOnFailureListener {
-                    Toast.makeText(this,"Не удалось скачать модель $source: ${it.localizedMessage}",Toast.LENGTH_LONG).show()
-                    next(i+1)
-                }
-            }.addOnFailureListener { next(i+1) }
+            }
+            val forced = selectedSource()
+            if (forced != null) translate(forced)
+            else languageId.identifyLanguage(item.text).addOnSuccessListener { detected ->
+                val language = normalized(detected)
+                translate(if (language in listOf("zh","en","ja","ko","ru")) language else "zh")
+            }.addOnFailureListener { translate("zh") }
         }
         next(0)
+    }
+    private fun onlineTranslate(provider: Int, text: String, source: String, target: String): String? {
+        fun encode(s: String) = URLEncoder.encode(s,"UTF-8")
+        val url: String
+        val payload: String
+        if (provider == 1) {
+            val key = prefs.getString("google_key", "").orEmpty()
+            if (key.isBlank()) return null
+            url = "https://translation.googleapis.com/language/translate/v2?key=${encode(key)}"
+            payload = "q=${encode(text)}&source=${encode(source)}&target=${encode(target)}&format=text"
+        } else {
+            val appId = prefs.getString("baidu_appid", "").orEmpty()
+            val secret = prefs.getString("baidu_secret", "").orEmpty()
+            if (appId.isBlank() || secret.isBlank()) return null
+            val salt = System.currentTimeMillis().toString()
+            fun baiduCode(lang: String) = when(lang) { "ja" -> "jp"; "ko" -> "kor"; else -> lang }
+            val bytes = MessageDigest.getInstance("MD5").digest("$appId$text$salt$secret".toByteArray(Charsets.UTF_8))
+            val sign = bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+            payload = "q=${encode(text)}&from=${encode(baiduCode(source))}&to=${encode(baiduCode(target))}&appid=${encode(appId)}&salt=$salt&sign=$sign"
+        }
+        val conn = URL(url).openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 12000
+            conn.readTimeout = 18000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+            if (conn.responseCode !in 200..299) return null
+            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            return if (provider == 1) {
+                json.getJSONObject("data").getJSONArray("translations").getJSONObject(0).getString("translatedText")
+                    .replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            } else json.getJSONArray("trans_result").getJSONObject(0).getString("dst")
+        } finally { conn.disconnect() }
     }
     private fun fail(message: String) { busy=false;bubble?.visibility=View.VISIBLE;Toast.makeText(this,message,Toast.LENGTH_LONG).show() }
     private fun showResult(items: List<Pair<Rect,String>>) {
@@ -235,7 +322,7 @@ class CaptureService : Service() {
             }
             view.setOnClickListener { dismissResult() }
             resultOverlay=view
-            wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT))
+            wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT).apply { flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE })
         } else {
             val layout=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(16,12,16,12);setBackgroundColor(Color.WHITE) }
             layout.addView(Button(this).apply { text="Закрыть ✕";setOnClickListener { dismissResult() } })
@@ -249,6 +336,8 @@ class CaptureService : Service() {
     override fun onDestroy() {
         selectingOverlay?.let { wm.removeView(it) };dismissResult();bubble?.let { wm.removeView(it) }
         display?.release();reader?.close();projection?.stop();recognizers.forEach { it.close() }
+        pendingTap?.let { handler.removeCallbacks(it) }
+        network.shutdownNow()
         languageId.close();translators.values.forEach { it.close() }
         super.onDestroy()
     }
