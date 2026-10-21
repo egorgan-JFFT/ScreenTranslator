@@ -56,6 +56,14 @@ class CaptureService : Service() {
     }
     private fun onBubbleTap() {
         if (busy) return
+        // The bubble also acts as a dismiss button while translations are visible.
+        if (resultOverlay != null) {
+            pendingTap?.let { handler.removeCallbacks(it) }
+            pendingTap = null
+            lastTap = 0L
+            dismissResult()
+            return
+        }
         val now = android.os.SystemClock.uptimeMillis()
         if (now - lastTap < 330L) {
             pendingTap?.let { handler.removeCallbacks(it) }
@@ -122,7 +130,17 @@ class CaptureService : Service() {
                     MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; oldX = p.x; oldY = p.y; moved = false; return true }
                     MotionEvent.ACTION_MOVE -> { if (abs(e.rawX-downX)>10 || abs(e.rawY-downY)>10) moved = true
                         if (moved) { p.x = oldX+(e.rawX-downX).toInt(); p.y = oldY+(e.rawY-downY).toInt(); wm.updateViewLayout(button,p) }; return true }
-                    MotionEvent.ACTION_UP -> { if (!moved) v.performClick(); return true }
+                    MotionEvent.ACTION_UP -> {
+                        val dy = e.rawY - downY
+                        // Swipe the TR bubble upward to dismiss translations, even though
+                        // the translation overlay itself does not intercept touches.
+                        if (dy < -65f * resources.displayMetrics.density && resultOverlay != null) {
+                            p.x = oldX; p.y = oldY
+                            wm.updateViewLayout(button, p)
+                            dismissResult()
+                        } else if (!moved) v.performClick()
+                        return true
+                    }
                 }
                 return false
             }
@@ -293,6 +311,8 @@ class CaptureService : Service() {
     }
     private fun fail(message: String) { busy=false;bubble?.visibility=View.VISIBLE;Toast.makeText(this,message,Toast.LENGTH_LONG).show() }
     private fun showResult(items: List<Pair<Rect,String>>) {
+        // Never accumulate multiple full-screen overlays.
+        dismissResult()
         bubble?.visibility=View.VISIBLE
         if (items.isEmpty()) { Toast.makeText(this,"Перевод не получен. Проверьте интернет и модели.",Toast.LENGTH_LONG).show();return }
         if (prefs.getInt("mode",0)==0) {
@@ -320,7 +340,8 @@ class CaptureService : Service() {
                     }
                 }
             }
-            view.setOnClickListener { dismissResult() }
+            // Overlay is intentionally NOT_TOUCHABLE so underlying apps remain usable.
+            // Dismiss it with an upward swipe on TR or a single TR tap.
             resultOverlay=view
             wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT).apply { flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE })
         } else {
