@@ -1,11 +1,22 @@
-# Screen Translator v0.4
+# Screen Translator v0.5
 
-Исправление настройки целевой версии Android: targetSdk 28 -> 29 (Android 10).
+Android 10+; Redmi Note 8 Pro; no ads.
 
-Загрузка модели китайский -> русский происходит только после установки, по кнопке в приложении.
+Changes:
+- Default: translations directly over original text.
+- Full screen or drag-to-select region.
+- Auto language ID (Chinese, English, Japanese, Korean OCR); output Russian.
+- Font size 10–30sp, default 14sp.
+- Black on white or white on black.
+- Separate window retained as secondary mode.
+- Language models downloaded at runtime, not during APK installation. First translation in a new language needs Internet and may take time.
 
-ВНИМАНИЕ: предупреждение Google Play Protect может сохраняться; targetSdk 29 не гарантирует снятие блокировки. Не отключайте Play Protect. Если установка снова блокируется, нужен точный статус Play Protect и диагностика установки (например, adb install).
+## Updating via GitHub Desktop
+Copy all contents over the cloned repository, commit, push. Download successful APK artifact from GitHub Actions.
 
-Сборка: скопируйте файлы поверх локального репозитория GitHub Desktop, Commit, Push, затем скачайте artifact из Actions.
-
-Сборка и установка v0.4 не проверены на устройстве.
+## Known limitations
+- Android screen-capture permission is required when starting the service.
+- Overlays approximate original line positions and do not reconstruct image backgrounds.
+- Auto language ID supports OCR for Chinese, Latin, Japanese and Korean scripts, not all languages.
+- Initial downloads may be slow. OCR of multiple scripts may return imperfect duplicate or wrong text.
+- Not compiled or device-tested in this environment.
