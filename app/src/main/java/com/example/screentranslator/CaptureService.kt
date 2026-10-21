@@ -64,6 +64,10 @@ class CaptureService : Service() {
     }
     private fun capture() {
         if(busy)return
+        if (!getSharedPreferences("models", MODE_PRIVATE).getBoolean("zh_ru_ready", false)) {
+            Toast.makeText(this, "Сначала скачайте модель перевода в приложении", Toast.LENGTH_LONG).show()
+            return
+        }
         busy=true
         bubble?.visibility=View.INVISIBLE
         resultOverlay?.let { wm.removeView(it) }; resultOverlay=null
@@ -80,7 +84,7 @@ class CaptureService : Service() {
                 recognizer.process(InputImage.fromBitmap(bitmap,0)).addOnSuccessListener { result ->
                     val lines=result.textBlocks.flatMap { it.lines }.filter { it.text.isNotBlank() }
                     if(lines.isEmpty()) { finishError("Текст не найден");return@addOnSuccessListener }
-                    translator.downloadModelIfNeeded().addOnSuccessListener {
+                    run {
                         val translations=mutableListOf<Pair<android.graphics.Rect,String>>()
                         fun next(index:Int) {
                             if(index>=lines.size) { showResult(translations);busy=false;return }
@@ -89,7 +93,7 @@ class CaptureService : Service() {
                                 translations.add(Pair(line.boundingBox ?: android.graphics.Rect(0,0,0,0),translated));next(index+1)
                             }.addOnFailureListener { next(index+1) }
                         };next(0)
-                    }.addOnFailureListener { finishError("Не удалось скачать модель перевода") }
+                    }
                 }.addOnFailureListener { finishError("Ошибка OCR: ${it.message}") }.addOnCompleteListener { bitmap.recycle() }
             } finally {image.close()}
         },400)

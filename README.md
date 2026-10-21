@@ -1,13 +1,19 @@
-# Screen Translator v0.2 (Android 10 / Redmi Note 8 Pro)
+# Screen Translator v0.3 — Китайский → Русский
 
-Experimental source project. Chinese OCR -> Russian translation, on-demand floating TR button, two display modes. No ads. The translation model is downloaded at first use (internet required).
+Проект для Android 10+ (Redmi Note 8 Pro). Без рекламы.
 
-## Build without Android Studio
+## Изменения
+- Добавлено разрешение INTERNET для скачивания модели ML Kit.
+- Модель перевода скачивается только после нажатия отдельной кнопки в приложении, а не при установке и не при нажатии TR.
+- Добавлен статус загрузки и сообщение об ошибке.
+- Перевод с плавающей кнопки TR и режимы «Окно» / «Поверх» сохранены.
 
-1. Create an empty public/private GitHub repository.
-2. Upload the CONTENTS of this folder to the repository root, including `.github/workflows/build-apk.yml` (do not upload the enclosing folder as an extra level).
-3. Open **Actions** -> **Build Android APK** -> **Run workflow**.
-4. When the build succeeds, download the `ScreenTranslator-v0.2-debug-apk` artifact and extract `app-debug.apk`.
-5. Install APK on Android 10, permit overlay windows and screen capture.
+## Важно
+Сама установка APK никогда не загружает модель. Установленный размер может превышать размер APK: библиотеки распаковываются и оптимизируются системой. Причина прежнего зависания установки не установлена; это обновление не гарантирует её устранения.
 
-This code has not been compiled or device-tested here. If GitHub Actions reports errors, share the build log for corrections. Overlay mode is experimental and does not remove original text background. Some apps prohibit screen capture. MIUI may require enabling background/autostart permission.
+## Сборка
+Загрузите содержимое папки в корень репозитория GitHub, сохранив .github/workflows/build.yml. Запустите Actions → Build Android APK.
+
+После установки: откройте приложение → «Скачать модель» → разрешите плавающие окна → «Запустить переводчик» → согласитесь на захват экрана → нажимайте TR.
+
+Китайский OCR ML Kit встроен в APK; отдельная загрузка касается модели перевода. Приложение не тестировалось на реальном устройстве.
