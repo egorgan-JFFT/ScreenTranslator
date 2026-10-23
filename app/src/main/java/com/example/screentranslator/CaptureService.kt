@@ -21,6 +21,11 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.*
 import kotlin.math.*
+import java.net.URL
+import java.net.HttpURLConnection
+import java.net.URLEncoder
+import java.security.MessageDigest
+import org.json.JSONObject
 
 class CaptureService : Service() {
     private lateinit var wm: WindowManager
@@ -82,7 +87,8 @@ class CaptureService : Service() {
                 if (resultOverlay != null) dismissResult() else capture(null)
             }
         }
-        val p = params(145, 115).apply { x = 0; y = 220 }
+        val side = (52f * resources.displayMetrics.density).toInt()
+        val p = params(side, side).apply { x = 0; y = 220 }
         val threshold = 12f * resources.displayMetrics.density
         val holdMs = 2000L
         button.setOnTouchListener(object : View.OnTouchListener {
@@ -99,10 +105,11 @@ class CaptureService : Service() {
             }
             fun armHold() {
                 cancelHold()
-                val x = lastX
-                val y = lastY
                 val task = Runnable {
                     if (!busy && anchor == null && resultOverlay == null) {
+                        // Anchor at the bubble's top-left corner, not the finger.
+                        val x = p.x.toFloat()
+                        val y = p.y.toFloat()
                         anchor = android.graphics.PointF(x, y)
                         selectionRect = Rect(x.toInt(), y.toInt(), x.toInt(), y.toInt())
                         showSelectionHint()
@@ -134,8 +141,10 @@ class CaptureService : Service() {
                             wm.updateViewLayout(button,p)
                         }
                         anchor?.let { start ->
-                            selectionRect = Rect(min(start.x,x).toInt(), min(start.y,y).toInt(),
-                                max(start.x,x).toInt(), max(start.y,y).toInt())
+                            val endX = p.x.toFloat()
+                            val endY = p.y.toFloat()
+                            selectionRect = Rect(min(start.x,endX).toInt(), min(start.y,endY).toInt(),
+                                max(start.x,endX).toInt(), max(start.y,endY).toInt())
                             selectionHint?.invalidate()
                         }
                         return true
@@ -187,7 +196,7 @@ class CaptureService : Service() {
             private val marker = Paint(3).apply { color = Color.YELLOW; textSize = 20f*density }
             override fun onDraw(canvas: Canvas) {
                 val start = anchor ?: return
-                canvas.drawText("➤",start.x,start.y,marker)
+                canvas.drawText("➤",start.x,start.y + 14f*density,marker)
                 selectionRect?.let { canvas.drawRect(it,outline) }
             }
         }
@@ -247,36 +256,115 @@ class CaptureService : Service() {
         if(!i.intersect(b)) return 0f
         return i.width().toFloat()*i.height() / max(1f,min(a.width().toFloat()*a.height(),b.width().toFloat()*b.height()))
     }
+    private val sourceCodes = arrayOf("auto", "zh", "en", "ja", "ko", "ru")
+    private val targetCodes = arrayOf("ru", "zh", "en", "ja", "ko")
+
     private fun translateAll(items: List<Segment>) {
-        val translated = mutableListOf<Pair<Rect,String>>()
+        val output = mutableListOf<Pair<Rect,String>>()
+        val provider = prefs.getInt("provider",0)
+        val configuredSource = sourceCodes[prefs.getInt("source",0).coerceIn(sourceCodes.indices)]
+        val target = targetCodes[prefs.getInt("target",0).coerceIn(targetCodes.indices)]
         fun next(i: Int) {
-            if (i >= items.size) { busy=false;showResult(translated);return }
-            val item=items[i]
-            languageId.identifyLanguage(item.text).addOnSuccessListener { detected ->
-                val source = when (detected) {
-                    "zh", "zh-CN", "zh-TW" -> TranslateLanguage.CHINESE
-                    "ja" -> TranslateLanguage.JAPANESE
-                    "ko" -> TranslateLanguage.KOREAN
-                    "en" -> TranslateLanguage.ENGLISH
-                    "ru" -> TranslateLanguage.RUSSIAN
-                    else -> if (item.text.any { it.code in 0x4E00..0x9FFF }) TranslateLanguage.CHINESE else TranslateLanguage.ENGLISH
-                }
-                if (source == TranslateLanguage.RUSSIAN) { next(i+1);return@addOnSuccessListener }
-                val translator = translators.getOrPut(source) {
-                    Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source)
-                        .setTargetLanguage(TranslateLanguage.RUSSIAN).build())
-                }
-                translator.downloadModelIfNeeded().addOnSuccessListener {
-                    translator.translate(item.text).addOnSuccessListener { text ->
-                        translated.add(Pair(item.rect,text));next(i+1)
+            if (i >= items.size) {
+                busy = false
+                if (output.isEmpty()) fail("Перевод не получен. Проверьте язык, API-ключ и подключение.")
+                else showResult(output)
+                return
+            }
+            val item = items[i]
+            fun translate(source: String) {
+                if (source == target) { next(i+1); return }
+                if (provider == 0) {
+                    val key = "$source:$target"
+                    val translator = try {
+                        translators.getOrPut(key) {
+                            Translation.getClient(TranslatorOptions.Builder()
+                                .setSourceLanguage(source).setTargetLanguage(target).build())
+                        }
+                    } catch (e: Exception) { next(i+1); return }
+                    translator.downloadModelIfNeeded().addOnSuccessListener {
+                        translator.translate(item.text).addOnSuccessListener { result ->
+                            output.add(item.rect to result)
+                            next(i+1)
+                        }.addOnFailureListener { next(i+1) }
                     }.addOnFailureListener { next(i+1) }
-                }.addOnFailureListener {
-                    Toast.makeText(this,"Не удалось скачать модель $source: ${it.localizedMessage}",Toast.LENGTH_LONG).show()
-                    next(i+1)
+                } else {
+                    Thread {
+                        val result = try {
+                            if (provider == 1) googleTranslate(item.text, source, target)
+                            else baiduTranslate(item.text, source, target)
+                        } catch (e: Exception) {
+                            handler.post { Toast.makeText(this, "Ошибка API: ${e.message}", Toast.LENGTH_LONG).show() }
+                            null
+                        }
+                        handler.post {
+                            if (result != null) output.add(item.rect to result)
+                            next(i+1)
+                        }
+                    }.start()
                 }
-            }.addOnFailureListener { next(i+1) }
+            }
+            if (configuredSource != "auto") translate(configuredSource)
+            else languageId.identifyLanguage(item.text).addOnSuccessListener { code ->
+                val source = when {
+                    code.startsWith("zh") -> "zh"
+                    code in arrayOf("en","ja","ko","ru") -> code
+                    item.text.any { it.code in 0x4E00..0x9FFF } -> "zh"
+                    else -> "en"
+                }
+                translate(source)
+            }.addOnFailureListener { translate("zh") }
         }
         next(0)
+    }
+
+    private fun postForm(endpoint: String, params: Map<String,String>): JSONObject {
+        val payload = params.entries.joinToString("&") {
+            URLEncoder.encode(it.key,"UTF-8")+"="+URLEncoder.encode(it.value,"UTF-8")
+        }
+        val conn = URL(endpoint).openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 12000
+            conn.readTimeout = 15000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type","application/x-www-form-urlencoded; charset=UTF-8")
+            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+            val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+            val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            if (conn.responseCode !in 200..299) throw Exception("HTTP ${conn.responseCode}: ${body.take(120)}")
+            return JSONObject(body)
+        } finally { conn.disconnect() }
+    }
+
+    private fun googleTranslate(text: String, source: String, target: String): String {
+        val key = prefs.getString("google_key","").orEmpty()
+        if (key.isBlank()) throw Exception("Не задан Google Cloud API key")
+        val response = postForm("https://translation.googleapis.com/language/translate/v2?key="+
+            URLEncoder.encode(key,"UTF-8"),
+            buildMap {
+                put("q",text); put("target",target); put("format","text")
+                if (source != "auto") put("source",source)
+            })
+        return android.text.Html.fromHtml(
+            response.getJSONObject("data").getJSONArray("translations")
+                .getJSONObject(0).getString("translatedText"), android.text.Html.FROM_HTML_MODE_LEGACY
+        ).toString()
+    }
+
+    private fun baiduTranslate(text: String, source: String, target: String): String {
+        val appid = prefs.getString("baidu_appid","").orEmpty()
+        val secret = prefs.getString("baidu_secret","").orEmpty()
+        if (appid.isBlank() || secret.isBlank()) throw Exception("Не заданы Baidu App ID / Secret")
+        val salt = System.currentTimeMillis().toString()
+        val raw = appid+text+salt+secret
+        val sign = MessageDigest.getInstance("MD5").digest(raw.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+        val result = postForm("https://fanyi-api.baidu.com/api/trans/vip/translate",
+            mapOf("q" to text,"from" to source,"to" to target,
+                "appid" to appid,"salt" to salt,"sign" to sign))
+        if (result.has("error_code")) throw Exception("Baidu ${result.optString("error_code")}: ${result.optString("error_msg")}")
+        return result.getJSONArray("trans_result").getJSONObject(0).getString("dst")
     }
     private fun fail(message: String) { busy=false;bubble?.visibility=View.VISIBLE;Toast.makeText(this,message,Toast.LENGTH_LONG).show() }
     private fun showResult(items: List<Pair<Rect,String>>) {
