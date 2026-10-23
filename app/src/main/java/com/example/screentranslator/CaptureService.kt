@@ -35,6 +35,7 @@ class CaptureService : Service() {
     private var display: android.hardware.display.VirtualDisplay? = null
     private var bubble: View? = null
     private var resultOverlay: View? = null
+    private var dismissButton: View? = null
     private var selectingOverlay: View? = null
     private var busy = false
     private var regionMode = false
@@ -147,7 +148,39 @@ class CaptureService : Service() {
         })
         bubble = button; wm.addView(button, p)
     }
-    private fun dismissResult() { resultOverlay?.let { wm.removeView(it) }; resultOverlay = null }
+    private fun dismissResult() {
+        dismissButton?.let { view ->
+            try { wm.removeView(view) } catch (_: IllegalArgumentException) {}
+        }
+        dismissButton = null
+        resultOverlay?.let { view ->
+            try { wm.removeView(view) } catch (_: IllegalArgumentException) {}
+        }
+        resultOverlay = null
+    }
+
+    private fun showDismissButton() {
+        dismissButton?.let {
+            try { wm.removeView(it) } catch (_: IllegalArgumentException) {}
+        }
+        val close = Button(this).apply {
+            text = "✕"
+            contentDescription = "Убрать перевод"
+            setOnClickListener { dismissResult() }
+            setBackgroundColor(Color.argb(235, 30, 30, 30))
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setPadding(0, 0, 0, 0)
+        }
+        dismissButton = close
+        val density = resources.displayMetrics.density
+        val p = params((52*density).toInt(), (52*density).toInt(), Gravity.TOP or Gravity.END).apply {
+            x = (12*density).toInt()
+            y = (65*density).toInt()
+        }
+        // Added after translation overlay, so this control is always above it.
+        wm.addView(close, p)
+    }
     private fun selectRegion() {
         bubble?.visibility = View.INVISIBLE
         val m = resources.displayMetrics
@@ -344,6 +377,7 @@ class CaptureService : Service() {
             // Dismiss it with an upward swipe on TR or a single TR tap.
             resultOverlay=view
             wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT).apply { flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE })
+            showDismissButton()
         } else {
             val layout=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(16,12,16,12);setBackgroundColor(Color.WHITE) }
             layout.addView(Button(this).apply { text="Закрыть ✕";setOnClickListener { dismissResult() } })
@@ -352,6 +386,7 @@ class CaptureService : Service() {
             layout.addView(scroll)
             resultOverlay=layout
             wm.addView(layout,params(resources.displayMetrics.widthPixels*9/10,resources.displayMetrics.heightPixels/2,Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+            showDismissButton()
         }
     }
     override fun onDestroy() {
