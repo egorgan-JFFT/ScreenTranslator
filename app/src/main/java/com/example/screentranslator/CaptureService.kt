@@ -136,13 +136,18 @@ class CaptureService : Service() {
                         }
                         if (abs(x-downX)>threshold || abs(y-downY)>threshold) moved = true
                         if (moved) {
+                            // Keep the real finger position even beyond the visible display.
+                            // WindowManager may clamp the visible bubble, but the selection
+                            // endpoint continues following the finger up to screen edges.
                             p.x = oldX+(x-downX).toInt()
                             p.y = oldY+(y-downY).toInt()
                             wm.updateViewLayout(button,p)
                         }
                         anchor?.let { start ->
-                            val endX = p.x.toFloat()
-                            val endY = p.y.toFloat()
+                            // End point is the *virtual* top-left corner of TR, even
+                            // when the actual window is clipped at the screen edge.
+                            val endX = (oldX+(x-downX)).coerceIn(0f, resources.displayMetrics.widthPixels.toFloat())
+                            val endY = (oldY+(y-downY)).coerceIn(0f, resources.displayMetrics.heightPixels.toFloat())
                             selectionRect = Rect(min(start.x,endX).toInt(), min(start.y,endY).toInt(),
                                 max(start.x,endX).toInt(), max(start.y,endY).toInt())
                             selectionHint?.invalidate()
@@ -156,6 +161,12 @@ class CaptureService : Service() {
                         anchor = null
                         removeSelectionHint()
                         selectionRect = null
+                        // On release, snap the square button back into the visible area.
+                        val maxX = (resources.displayMetrics.widthPixels-side).coerceAtLeast(0)
+                        val maxY = (resources.displayMetrics.heightPixels-side).coerceAtLeast(0)
+                        p.x = p.x.coerceIn(0,maxX)
+                        p.y = p.y.coerceIn(0,maxY)
+                        wm.updateViewLayout(button,p)
                         if (wasSelecting) {
                             if (rect != null && rect.width()>30 && rect.height()>30) {
                                 dismissResult()
@@ -377,21 +388,69 @@ class CaptureService : Service() {
                 val textPaint=Paint(3).apply { color=if(dark) Color.WHITE else Color.BLACK; textSize=size }
                 val bg=Paint().apply { color=if(dark) Color.BLACK else Color.WHITE }
                 override fun onDraw(canvas: Canvas) {
-                    for((rect, text) in items) {
-                        val maxWidth = max(rect.width().toFloat(),size*5f).coerceAtMost(width-rect.left.toFloat()-8f)
-                        if(maxWidth<=0f) continue
-                        val words=text.split(" ")
-                        val lines=mutableListOf<String>();var line=""
-                        for(word in words) {
-                            val candidate=if(line.isEmpty()) word else "$line $word"
-                            if(line.isNotEmpty() && textPaint.measureText(candidate)>maxWidth) { lines.add(line);line=word }
-                            else line=candidate
+                    // Lay out translated blocks in reading order, reserving the
+                    // actual wrapped height of each block before drawing the next.
+                    // This prevents overlapping labels when Russian is longer.
+                    val ordered = items.sortedWith(compareBy<Pair<Rect,String>> { it.first.top }.thenBy { it.first.left })
+                    val occupied = mutableListOf<RectF>()
+                    val margin = 5f * resources.displayMetrics.density
+                    val lineHeight = size * 1.3f
+                    val screenW = width.toFloat()
+                    val screenH = height.toFloat()
+                    for ((rect, translated) in ordered) {
+                        val left = rect.left.toFloat().coerceIn(0f,(screenW-size*5).coerceAtLeast(0f))
+                        // Allow more horizontal space than the narrow original Chinese line.
+                        val desiredWidth = max(rect.width().toFloat(), min(screenW*0.82f, size*21f))
+                        val blockWidth = min(desiredWidth, screenW-left-margin).coerceAtLeast(size*2f)
+                        val textWidth = (blockWidth-2f*margin).coerceAtLeast(size)
+                        val lines = mutableListOf<String>()
+                        var current = ""
+                        fun flushLine() { if (current.isNotEmpty()) { lines.add(current); current="" } }
+                        for (paragraph in translated.split('\n')) {
+                            for (word in paragraph.split(Regex("\\s+"))) {
+                                if (word.isEmpty()) continue
+                                val candidate = if (current.isEmpty()) word else "$current $word"
+                                if (textPaint.measureText(candidate) <= textWidth) { current = candidate; continue }
+                                flushLine()
+                                // Break even a single long unspaced word if necessary.
+                                for (char in word) {
+                                    val attempt = current+char
+                                    if (current.isNotEmpty() && textPaint.measureText(attempt)>textWidth) flushLine()
+                                    current += char
+                                }
+                            }
+                            flushLine()
                         }
-                        if(line.isNotEmpty()) lines.add(line)
-                        val lineHeight=size*1.22f
-                        val bottom=(rect.top+lines.size*lineHeight+6f).coerceAtMost(height.toFloat())
-                        canvas.drawRect(rect.left.toFloat(),rect.top.toFloat(),(rect.left+maxWidth+8f).coerceAtMost(width.toFloat()),bottom,bg)
-                        for((index,s) in lines.withIndex()) canvas.drawText(s,rect.left+4f,rect.top+size+index*lineHeight,textPaint)
+                        if (lines.isEmpty()) continue
+                        val blockHeight = lines.size*lineHeight+2f*margin
+                        var top = rect.top.toFloat().coerceAtLeast(0f)
+                        // Search for a non-overlapping slot, including across columns.
+                        var attempts = 0
+                        while (attempts++ < ordered.size+4) {
+                            val candidate = RectF(left,top,left+blockWidth,top+blockHeight)
+                            val collision = occupied.firstOrNull { RectF.intersects(it,candidate) }
+                            if (collision == null) break
+                            top = collision.bottom+2f
+                        }
+                        // If bottom space is exhausted, find a free slot from the top.
+                        if (top+blockHeight>screenH) {
+                            top=0f
+                            var tries=0
+                            while (tries++<ordered.size+4) {
+                                val candidate=RectF(left,top,left+blockWidth,top+blockHeight)
+                                val collision=occupied.firstOrNull { RectF.intersects(it,candidate) }
+                                if (collision==null) break
+                                top=collision.bottom+2f
+                            }
+                        }
+                        // No room: do not paint on top of another translated block.
+                        if (top+blockHeight>screenH) continue
+                        val box=RectF(left,top,left+blockWidth,top+blockHeight)
+                        occupied.add(box)
+                        canvas.drawRect(box,bg)
+                        for ((index,line) in lines.withIndex()) {
+                            canvas.drawText(line,left+margin,top+margin+size+index*lineHeight,textPaint)
+                        }
                     }
                 }
             }
