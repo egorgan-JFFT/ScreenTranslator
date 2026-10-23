@@ -21,12 +21,6 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.*
 import kotlin.math.*
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.security.MessageDigest
-import java.util.concurrent.Executors
-import org.json.JSONObject
 
 class CaptureService : Service() {
     private lateinit var wm: WindowManager
@@ -35,53 +29,12 @@ class CaptureService : Service() {
     private var display: android.hardware.display.VirtualDisplay? = null
     private var bubble: View? = null
     private var resultOverlay: View? = null
-    private var dismissButton: View? = null
     private var selectingOverlay: View? = null
     private var busy = false
-    private var regionMode = false
-    private var pendingTap: Runnable? = null
-    private var lastTap = 0L
-    private val network = Executors.newSingleThreadExecutor()
-    private val languageCodes = arrayOf("ru", "zh", "en", "ja", "ko")
-    private fun selectedTarget(): String = languageCodes[prefs.getInt("target",0).coerceIn(0,4)]
-    private fun selectedSource(): String? = when (prefs.getInt("source",0)) {
-        1 -> "zh"; 2 -> "en"; 3 -> "ja"; 4 -> "ko"; 5 -> "ru"; else -> null
-    }
-    private fun normalized(code: String): String = when {
-        code.startsWith("zh") -> "zh"
-        code.startsWith("ja") -> "ja"
-        code.startsWith("ko") -> "ko"
-        code.startsWith("ru") -> "ru"
-        code.startsWith("en") -> "en"
-        else -> if (code == "und") "zh" else code
-    }
-    private fun onBubbleTap() {
-        if (busy) return
-        // The bubble also acts as a dismiss button while translations are visible.
-        if (resultOverlay != null) {
-            pendingTap?.let { handler.removeCallbacks(it) }
-            pendingTap = null
-            lastTap = 0L
-            dismissResult()
-            return
-        }
-        val now = android.os.SystemClock.uptimeMillis()
-        if (now - lastTap < 330L) {
-            pendingTap?.let { handler.removeCallbacks(it) }
-            pendingTap = null
-            lastTap = 0L
-            regionMode = !regionMode
-            Toast.makeText(this, if (regionMode) "Режим: выделить область" else "Режим: весь экран", Toast.LENGTH_SHORT).show()
-        } else {
-            lastTap = now
-            val action = Runnable {
-                pendingTap = null
-                if (!busy) { dismissResult(); if (regionMode) selectRegion() else capture(null) }
-            }
-            pendingTap = action
-            handler.postDelayed(action, 340L)
-        }
-    }
+    private var anchor: android.graphics.PointF? = null
+    private var selectionRect: Rect? = null
+    private var holdRunnable: Runnable? = null
+    private var selectionHint: View? = null
     private val handler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private val languageId = LanguageIdentification.getClient()
@@ -122,96 +75,127 @@ class CaptureService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT).apply { this.gravity = gravity }
     private fun showBubble() {
-        val button = Button(this).apply { text = "TR"; setOnClickListener { onBubbleTap() } }
+        val button = Button(this).apply {
+            text = "TR"
+            setOnClickListener {
+                if (busy) return@setOnClickListener
+                if (resultOverlay != null) dismissResult() else capture(null)
+            }
+        }
         val p = params(145, 115).apply { x = 0; y = 220 }
+        val threshold = 12f * resources.displayMetrics.density
+        val holdMs = 2000L
         button.setOnTouchListener(object : View.OnTouchListener {
-            var downX = 0f; var downY = 0f; var oldX = 0; var oldY = 0; var moved = false
+            var downX = 0f
+            var downY = 0f
+            var oldX = 0
+            var oldY = 0
+            var moved = false
+            var lastX = 0f
+            var lastY = 0f
+            fun cancelHold() {
+                holdRunnable?.let { handler.removeCallbacks(it) }
+                holdRunnable = null
+            }
+            fun armHold() {
+                cancelHold()
+                val x = lastX
+                val y = lastY
+                val task = Runnable {
+                    if (!busy && anchor == null && resultOverlay == null) {
+                        anchor = android.graphics.PointF(x, y)
+                        selectionRect = Rect(x.toInt(), y.toInt(), x.toInt(), y.toInt())
+                        showSelectionHint()
+                    }
+                }
+                holdRunnable = task
+                handler.postDelayed(task, holdMs)
+            }
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; oldX = p.x; oldY = p.y; moved = false; return true }
-                    MotionEvent.ACTION_MOVE -> { if (abs(e.rawX-downX)>10 || abs(e.rawY-downY)>10) moved = true
-                        if (moved) { p.x = oldX+(e.rawX-downX).toInt(); p.y = oldY+(e.rawY-downY).toInt(); wm.updateViewLayout(button,p) }; return true }
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = e.rawX; downY = e.rawY
+                        lastX = e.rawX; lastY = e.rawY
+                        oldX = p.x; oldY = p.y; moved = false
+                        anchor = null
+                        armHold()
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val x = e.rawX; val y = e.rawY
+                        if (abs(x-lastX) > threshold || abs(y-lastY) > threshold) {
+                            lastX = x; lastY = y
+                            if (anchor == null) armHold()
+                        }
+                        if (abs(x-downX)>threshold || abs(y-downY)>threshold) moved = true
+                        if (moved) {
+                            p.x = oldX+(x-downX).toInt()
+                            p.y = oldY+(y-downY).toInt()
+                            wm.updateViewLayout(button,p)
+                        }
+                        anchor?.let { start ->
+                            selectionRect = Rect(min(start.x,x).toInt(), min(start.y,y).toInt(),
+                                max(start.x,x).toInt(), max(start.y,y).toInt())
+                            selectionHint?.invalidate()
+                        }
+                        return true
+                    }
                     MotionEvent.ACTION_UP -> {
-                        val dy = e.rawY - downY
-                        // Swipe the TR bubble upward to dismiss translations, even though
-                        // the translation overlay itself does not intercept touches.
-                        if (dy < -65f * resources.displayMetrics.density && resultOverlay != null) {
-                            p.x = oldX; p.y = oldY
-                            wm.updateViewLayout(button, p)
+                        cancelHold()
+                        val rect = selectionRect
+                        val wasSelecting = anchor != null
+                        anchor = null
+                        removeSelectionHint()
+                        selectionRect = null
+                        if (wasSelecting) {
+                            if (rect != null && rect.width()>30 && rect.height()>30) {
+                                dismissResult()
+                                capture(rect)
+                            }
+                        } else if (!moved) {
+                            v.performClick()
+                        } else if (e.rawY-downY < -65f*resources.displayMetrics.density && resultOverlay != null) {
                             dismissResult()
-                        } else if (!moved) v.performClick()
+                        }
+                        return true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        cancelHold(); anchor = null; selectionRect = null; removeSelectionHint()
                         return true
                     }
                 }
                 return false
             }
         })
-        bubble = button; wm.addView(button, p)
+        bubble = button
+        wm.addView(button,p)
     }
     private fun dismissResult() {
-        dismissButton?.let { view ->
-            try { wm.removeView(view) } catch (_: IllegalArgumentException) {}
-        }
-        dismissButton = null
-        resultOverlay?.let { view ->
-            try { wm.removeView(view) } catch (_: IllegalArgumentException) {}
-        }
+        resultOverlay?.let { try { wm.removeView(it) } catch (_: IllegalArgumentException) {} }
         resultOverlay = null
     }
-
-    private fun showDismissButton() {
-        dismissButton?.let {
-            try { wm.removeView(it) } catch (_: IllegalArgumentException) {}
-        }
-        val close = Button(this).apply {
-            text = "✕"
-            contentDescription = "Убрать перевод"
-            setOnClickListener { dismissResult() }
-            setBackgroundColor(Color.argb(235, 30, 30, 30))
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            setPadding(0, 0, 0, 0)
-        }
-        dismissButton = close
-        val density = resources.displayMetrics.density
-        val p = params((52*density).toInt(), (52*density).toInt(), Gravity.TOP or Gravity.END).apply {
-            x = (12*density).toInt()
-            y = (65*density).toInt()
-        }
-        // Added after translation overlay, so this control is always above it.
-        wm.addView(close, p)
+    private fun removeSelectionHint() {
+        selectionHint?.let { try { wm.removeView(it) } catch (_: IllegalArgumentException) {} }
+        selectionHint = null
     }
-    private fun selectRegion() {
-        bubble?.visibility = View.INVISIBLE
-        val m = resources.displayMetrics
-        val view = object : View(this) {
-            var startX = 0f; var startY = 0f; var endX = 0f; var endY = 0f
-            val shade = Paint().apply { color = Color.argb(90,0,0,0) }
-            val outline = Paint(3).apply { color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = 4f }
-            val textPaint = Paint(3).apply { color = Color.WHITE; textSize = 36f }
-            override fun onDraw(c: Canvas) {
-                c.drawColor(Color.TRANSPARENT)
-                c.drawText("Выделите область пальцем", 24f, 65f, textPaint)
-                if (abs(endX-startX)>3 && abs(endY-startY)>3) {
-                    c.drawRect(min(startX,endX),min(startY,endY),max(startX,endX),max(startY,endY),shade)
-                    c.drawRect(min(startX,endX),min(startY,endY),max(startX,endX),max(startY,endY),outline)
-                }
+    private fun showSelectionHint() {
+        val density = resources.displayMetrics.density
+        val overlay = object : View(this) {
+            private val outline = Paint(3).apply {
+                color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = 2f*density
             }
-            override fun onTouchEvent(e: MotionEvent): Boolean {
-                when(e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { startX=e.x;startY=e.y;endX=e.x;endY=e.y;invalidate();return true }
-                    MotionEvent.ACTION_MOVE -> { endX=e.x;endY=e.y;invalidate();return true }
-                    MotionEvent.ACTION_UP -> { endX=e.x;endY=e.y
-                        val rect=Rect(min(startX,endX).toInt(),min(startY,endY).toInt(),max(startX,endX).toInt(),max(startY,endY).toInt())
-                        selectingOverlay?.let { wm.removeView(it) };selectingOverlay=null
-                        if(rect.width()>24 && rect.height()>24) capture(rect) else bubble?.visibility=View.VISIBLE
-                        return true }
-                }
-                return true
+            private val marker = Paint(3).apply { color = Color.YELLOW; textSize = 20f*density }
+            override fun onDraw(canvas: Canvas) {
+                val start = anchor ?: return
+                canvas.drawText("➤",start.x,start.y,marker)
+                selectionRect?.let { canvas.drawRect(it,outline) }
             }
         }
-        selectingOverlay = view
-        wm.addView(view, params(m.widthPixels, m.heightPixels))
+        selectionHint = overlay
+        val m = resources.displayMetrics
+        wm.addView(overlay,params(m.widthPixels,m.heightPixels).apply {
+            flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        })
     }
     private fun capture(region: Rect?) {
         if (busy) return
@@ -265,87 +249,37 @@ class CaptureService : Service() {
     }
     private fun translateAll(items: List<Segment>) {
         val translated = mutableListOf<Pair<Rect,String>>()
-        val target = selectedTarget()
-        val provider = prefs.getInt("provider",0)
         fun next(i: Int) {
-            if (i >= items.size) { busy=false; showResult(translated); return }
-            val item = items[i]
-            fun translate(source: String) {
-                if (source == target) { next(i+1); return }
-                if (provider == 0) {
-                    val client = translators.getOrPut("$source:$target") {
-                        Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source)
-                            .setTargetLanguage(target).build())
-                    }
-                    client.downloadModelIfNeeded().addOnSuccessListener {
-                        client.translate(item.text).addOnSuccessListener { result ->
-                            translated.add(item.rect to result); next(i+1)
-                        }.addOnFailureListener { next(i+1) }
-                    }.addOnFailureListener { e ->
-                        Toast.makeText(this,"Модель: ${e.localizedMessage}",Toast.LENGTH_LONG).show()
-                        next(i+1)
-                    }
-                } else {
-                    network.execute {
-                        val result = try { onlineTranslate(provider, item.text, source, target) }
-                                     catch (e: Exception) { android.util.Log.e("ScreenTranslator", "Online translation failed", e); null }
-                        handler.post {
-                            if (result != null) translated.add(item.rect to result)
-                            else Toast.makeText(this, "Ошибка онлайн-перевода. Проверьте ключ API и сеть", Toast.LENGTH_LONG).show()
-                            next(i+1)
-                        }
-                    }
+            if (i >= items.size) { busy=false;showResult(translated);return }
+            val item=items[i]
+            languageId.identifyLanguage(item.text).addOnSuccessListener { detected ->
+                val source = when (detected) {
+                    "zh", "zh-CN", "zh-TW" -> TranslateLanguage.CHINESE
+                    "ja" -> TranslateLanguage.JAPANESE
+                    "ko" -> TranslateLanguage.KOREAN
+                    "en" -> TranslateLanguage.ENGLISH
+                    "ru" -> TranslateLanguage.RUSSIAN
+                    else -> if (item.text.any { it.code in 0x4E00..0x9FFF }) TranslateLanguage.CHINESE else TranslateLanguage.ENGLISH
                 }
-            }
-            val forced = selectedSource()
-            if (forced != null) translate(forced)
-            else languageId.identifyLanguage(item.text).addOnSuccessListener { detected ->
-                val language = normalized(detected)
-                translate(if (language in listOf("zh","en","ja","ko","ru")) language else "zh")
-            }.addOnFailureListener { translate("zh") }
+                if (source == TranslateLanguage.RUSSIAN) { next(i+1);return@addOnSuccessListener }
+                val translator = translators.getOrPut(source) {
+                    Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source)
+                        .setTargetLanguage(TranslateLanguage.RUSSIAN).build())
+                }
+                translator.downloadModelIfNeeded().addOnSuccessListener {
+                    translator.translate(item.text).addOnSuccessListener { text ->
+                        translated.add(Pair(item.rect,text));next(i+1)
+                    }.addOnFailureListener { next(i+1) }
+                }.addOnFailureListener {
+                    Toast.makeText(this,"Не удалось скачать модель $source: ${it.localizedMessage}",Toast.LENGTH_LONG).show()
+                    next(i+1)
+                }
+            }.addOnFailureListener { next(i+1) }
         }
         next(0)
     }
-    private fun onlineTranslate(provider: Int, text: String, source: String, target: String): String? {
-        fun encode(s: String) = URLEncoder.encode(s,"UTF-8")
-        val url: String
-        val payload: String
-        if (provider == 1) {
-            val key = prefs.getString("google_key", "").orEmpty()
-            if (key.isBlank()) return null
-            url = "https://translation.googleapis.com/language/translate/v2?key=${encode(key)}"
-            payload = "q=${encode(text)}&source=${encode(source)}&target=${encode(target)}&format=text"
-        } else {
-            val appId = prefs.getString("baidu_appid", "").orEmpty()
-            val secret = prefs.getString("baidu_secret", "").orEmpty()
-            if (appId.isBlank() || secret.isBlank()) return null
-            val salt = System.currentTimeMillis().toString()
-            fun baiduCode(lang: String) = when(lang) { "ja" -> "jp"; "ko" -> "kor"; else -> lang }
-            val bytes = MessageDigest.getInstance("MD5").digest("$appId$text$salt$secret".toByteArray(Charsets.UTF_8))
-            val sign = bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
-            url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
-            payload = "q=${encode(text)}&from=${encode(baiduCode(source))}&to=${encode(baiduCode(target))}&appid=${encode(appId)}&salt=$salt&sign=$sign"
-        }
-        val conn = URL(url).openConnection() as HttpURLConnection
-        try {
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 12000
-            conn.readTimeout = 18000
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode !in 200..299) return null
-            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-            return if (provider == 1) {
-                json.getJSONObject("data").getJSONArray("translations").getJSONObject(0).getString("translatedText")
-                    .replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-            } else json.getJSONArray("trans_result").getJSONObject(0).getString("dst")
-        } finally { conn.disconnect() }
-    }
     private fun fail(message: String) { busy=false;bubble?.visibility=View.VISIBLE;Toast.makeText(this,message,Toast.LENGTH_LONG).show() }
     private fun showResult(items: List<Pair<Rect,String>>) {
-        // Never accumulate multiple full-screen overlays.
-        dismissResult()
         bubble?.visibility=View.VISIBLE
         if (items.isEmpty()) { Toast.makeText(this,"Перевод не получен. Проверьте интернет и модели.",Toast.LENGTH_LONG).show();return }
         if (prefs.getInt("mode",0)==0) {
@@ -373,11 +307,22 @@ class CaptureService : Service() {
                     }
                 }
             }
-            // Overlay is intentionally NOT_TOUCHABLE so underlying apps remain usable.
-            // Dismiss it with an upward swipe on TR or a single TR tap.
+            // Swipe UP on the translation layer to dismiss it (as in v0.5).
+            view.setOnTouchListener(object : View.OnTouchListener {
+                var startY = 0f
+                override fun onTouch(v: View, event: MotionEvent): Boolean {
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> { startY = event.rawY; return true }
+                        MotionEvent.ACTION_UP -> {
+                            if (startY-event.rawY > 45f*resources.displayMetrics.density) dismissResult()
+                            return true
+                        }
+                    }
+                    return true
+                }
+            })
             resultOverlay=view
-            wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT).apply { flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE })
-            showDismissButton()
+            wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT))
         } else {
             val layout=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(16,12,16,12);setBackgroundColor(Color.WHITE) }
             layout.addView(Button(this).apply { text="Закрыть ✕";setOnClickListener { dismissResult() } })
@@ -386,14 +331,13 @@ class CaptureService : Service() {
             layout.addView(scroll)
             resultOverlay=layout
             wm.addView(layout,params(resources.displayMetrics.widthPixels*9/10,resources.displayMetrics.heightPixels/2,Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
-            showDismissButton()
         }
     }
     override fun onDestroy() {
+        holdRunnable?.let { handler.removeCallbacks(it) }
+        removeSelectionHint()
         selectingOverlay?.let { wm.removeView(it) };dismissResult();bubble?.let { wm.removeView(it) }
         display?.release();reader?.close();projection?.stop();recognizers.forEach { it.close() }
-        pendingTap?.let { handler.removeCallbacks(it) }
-        network.shutdownNow()
         languageId.close();translators.values.forEach { it.close() }
         super.onDestroy()
     }
