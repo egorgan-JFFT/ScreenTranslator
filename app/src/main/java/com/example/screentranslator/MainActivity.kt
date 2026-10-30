@@ -70,13 +70,14 @@ class MainActivity : Activity() {
         credential("Google Cloud API key", "google_key")
         credential("Baidu App ID", "baidu_appid")
         credential("Baidu Secret", "baidu_secret")
-        spinner("Цвет перевода", arrayOf("Чёрный текст / белый фон", "Белый текст / чёрный фон"), "theme", 0)
-        root.addView(TextView(this).apply { text = "Размер текста"; textSize = 16f; setPadding(0, 18, 0, 0) })
+        spinner("Цвет перевода", arrayOf("Чёрный текст / светлый фон", "Белый текст / тёмный фон"), "theme", 0)
+        spinner("Разделение блоков", arrayOf("Разными цветами и рамкой", "Без разделения"), "colors", 0)
+        root.addView(TextView(this).apply { text = "Максимальный размер текста (меньше — подбирается автоматически)"; textSize = 16f; setPadding(0, 18, 0, 0) })
         val sizeLabel = TextView(this)
-        val seek = SeekBar(this).apply { max = 20; progress = (prefs.getInt("size", 14) - 10).coerceIn(0, 20) }
-        sizeLabel.text = "${seek.progress + 10} sp"
+        val seek = SeekBar(this).apply { max = 24; progress = (prefs.getInt("size", 14) - 6).coerceIn(0, 24) }
+        sizeLabel.text = "${seek.progress + 6} sp"
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(bar: SeekBar?, value: Int, fromUser: Boolean) { sizeLabel.text = "${value + 10} sp"; prefs.edit().putInt("size", value + 10).apply() }
+            override fun onProgressChanged(bar: SeekBar?, value: Int, fromUser: Boolean) { sizeLabel.text = "${value + 6} sp"; prefs.edit().putInt("size", value + 6).apply() }
             override fun onStartTrackingTouch(bar: SeekBar?) {}
             override fun onStopTrackingTouch(bar: SeekBar?) {}
         })
@@ -100,7 +101,7 @@ class MainActivity : Activity() {
             startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), requestCapture)
         } })
         root.addView(Button(this).apply { text = "Остановить"; setOnClickListener { stopService(Intent(this@MainActivity, CaptureService::class.java)) } })
-        root.addView(TextView(this).apply { text = "Закрыть перевод: нажать TR, крестик справа вверху или свайп вверх. Если перевод не помещается, его можно прокрутить пальцем.\n\nЯзык оригинала «Авто» и «Китайский» используют китайское распознавание (оно читает и латиницу). Для японского и корейского выберите язык явно. Русский текст в оригинале распознаётся плохо: ML Kit не поддерживает кириллицу.\n\nXiaomi/MIUI: в настройках приложения включите «Отображать всплывающие окна, когда запущено в фоновом режиме» и «Всплывающие окна», а в «Контроле активности» выберите «Нет ограничений»."; textSize = 14f })
+        root.addView(TextView(this).apply { text = "Закрыть перевод: нажать TR, крестик справа вверху или свайп вверх. Тап по блоку перевода — полный оригинал и перевод внизу экрана. Оранжевый уголок означает, что текст в блоке обрезан.\n\nЯзык оригинала «Авто» и «Китайский» используют китайское распознавание (оно читает и латиницу). Для японского и корейского выберите язык явно. Русский текст в оригинале распознаётся плохо: ML Kit не поддерживает кириллицу.\n\nXiaomi/MIUI: в настройках приложения включите «Отображать всплывающие окна, когда запущено в фоновом режиме» и «Всплывающие окна», а в «Контроле активности» выберите «Нет ограничений»."; textSize = 14f })
         setContentView(scroll)
     }
     @Deprecated("Legacy result API")

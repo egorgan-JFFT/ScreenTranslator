@@ -28,6 +28,8 @@ import java.security.MessageDigest
 import org.json.JSONObject
 
 /**
+ * v0.11: перевод стоит на месте оригинала (вписывается в его рамку, шрифт уменьшается),
+ *   соседние блоки разделены цветом, тап по блоку — полный текст.
  * v0.10
  * - Все окна поверх экрана используют экранные координаты (с учётом строки состояния и выреза),
  *   поэтому рамка, распознанный текст и перевод совпадают по положению.
@@ -44,6 +46,7 @@ class CaptureService : Service() {
     private var bubble: View? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var resultOverlay: View? = null
+    private var detailPanel: View? = null
     private var busy = false
     private var holdRect: Rect? = null          // кнопка TR в момент начала выделения (экранные координаты)
     private var selectionRect: Rect? = null     // текущая рамка (экранные координаты)
@@ -56,7 +59,9 @@ class CaptureService : Service() {
     private var recognizerKind = -1
     private val translators = mutableMapOf<String, Translator>()
     private data class Segment(val rect: Rect, val text: String)
-    private class Placed(val box: RectF, val lines: List<String>)
+    private class Shown(val rect: Rect, val original: String, val translated: String)
+    private class Placed(val box: RectF, val lines: List<String>, val size: Float, val truncated: Boolean,
+                         val item: Shown, var color: Int = 0)
 
     private val sourceCodes = arrayOf("auto", "zh", "en", "ja", "ko", "ru")
     private val targetCodes = arrayOf("ru", "zh", "en", "ja", "ko")
@@ -229,6 +234,7 @@ class CaptureService : Service() {
     }
 
     private fun dismissResult() {
+        dismissDetail()
         resultOverlay?.let { try { wm.removeView(it) } catch (_: IllegalArgumentException) {} }
         resultOverlay = null
     }
@@ -336,7 +342,7 @@ class CaptureService : Service() {
     }
 
     private fun translateAll(items: List<Segment>) {
-        val output = mutableListOf<Pair<Rect, String>>()
+        val output = mutableListOf<Shown>()
         val provider = prefs.getInt("provider", 0)
         val configuredSource = sourceCodes[prefs.getInt("source", 0).coerceIn(sourceCodes.indices)]
         val target = targetCodes[prefs.getInt("target", 0).coerceIn(targetCodes.indices)]
@@ -349,7 +355,7 @@ class CaptureService : Service() {
             }
             val item = items[i]
             fun translate(source: String) {
-                if (source == target) { output.add(item.rect to item.text); next(i + 1); return }
+                if (source == target) { output.add(Shown(item.rect, item.text, item.text)); next(i + 1); return }
                 if (provider == 0) {
                     val key = "$source:$target"
                     val translator = try {
@@ -360,7 +366,7 @@ class CaptureService : Service() {
                     } catch (e: Exception) { next(i + 1); return }
                     translator.downloadModelIfNeeded().addOnSuccessListener {
                         translator.translate(item.text).addOnSuccessListener { result ->
-                            output.add(item.rect to result)
+                            output.add(Shown(item.rect, item.text, result))
                             next(i + 1)
                         }.addOnFailureListener { next(i + 1) }
                     }.addOnFailureListener { next(i + 1) }
@@ -374,7 +380,7 @@ class CaptureService : Service() {
                             null
                         }
                         handler.post {
-                            if (result != null) output.add(item.rect to result)
+                            if (result != null) output.add(Shown(item.rect, item.text, result))
                             next(i + 1)
                         }
                     }.start()
@@ -471,36 +477,102 @@ class CaptureService : Service() {
         return lines
     }
 
-    /** Раскладывает все блоки без пропусков и без наложений. Возвращает блоки и нижнюю границу. */
-    private fun layoutBlocks(items: List<Pair<Rect, String>>, size: Float, screenW: Float): Pair<List<Placed>, Float> {
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = size }
-        val ordered = items.sortedWith(compareBy<Pair<Rect, String>> { it.first.top }.thenBy { it.first.left })
-        val placed = mutableListOf<Placed>()
-        val margin = dp(4f)
-        val lineHeight = size * 1.25f
-        var maxBottom = 0f
-        for ((rect, translated) in ordered) {
-            val left = rect.left.toFloat().coerceIn(0f, (screenW - size * 5).coerceAtLeast(0f))
-            val desiredWidth = max(rect.width().toFloat(), min(screenW * 0.82f, size * 21f))
-            val blockWidth = min(desiredWidth, screenW - left).coerceAtLeast(size * 2f)
-            val lines = wrap(translated, paint, (blockWidth - 2f * margin).coerceAtLeast(size))
-            if (lines.isEmpty()) continue
-            val blockHeight = lines.size * lineHeight + 2f * margin
-            var top = rect.top.toFloat().coerceAtLeast(0f)
-            var guard = 0
-            while (guard++ < 1000) {
-                val candidate = RectF(left, top, left + blockWidth, top + blockHeight)
-                val hit = placed.firstOrNull { RectF.intersects(it.box, candidate) } ?: break
-                top = hit.box.bottom + 1f
+    private fun lineHeightFor(size: Float) = size * 1.15f
+
+    /**
+     * Каждый перевод стоит на месте своего оригинала. Рамка может расшириться вправо и вниз,
+     * но только в свободное место до соседнего оригинала. Потом шрифт уменьшается, пока текст не влезет.
+     */
+    private fun layoutInPlace(items: List<Shown>, maxSize: Float, minSize: Float, screenW: Float, screenH: Float): List<Placed> {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val pad = dp(2f)
+        val gap = dp(2f)
+        val result = mutableListOf<Placed>()
+        for (item in items) {
+            val r = item.rect
+            val others = items.filter { it !== item }.map { it.rect }
+            // Вправо: до ближайшего оригинала справа на той же высоте или до края экрана.
+            var right = screenW
+            for (o in others) if (o.left >= r.right - 2 && o.top < r.bottom && o.bottom > r.top) right = min(right, o.left - gap)
+            right = max(right, r.right.toFloat())
+            // Вниз: не больше высоты ещё одной строки и до ближайшего оригинала ниже.
+            var bottom = min(screenH, r.bottom + r.height() * 1.2f)
+            for (o in others) if (o.top >= r.bottom - 2 && o.left < right && o.right > r.left) bottom = min(bottom, o.top - gap)
+            bottom = max(bottom, r.bottom.toFloat())
+            val box = RectF(r.left.toFloat(), r.top.toFloat(), right, bottom)
+            val textW = (box.width() - 2 * pad).coerceAtLeast(dp(8f))
+            val textH = (box.height() - 2 * pad).coerceAtLeast(dp(6f))
+            // Самый крупный шрифт, при котором текст влезает. Не крупнее оригинала и настройки.
+            var size = min(maxSize, max(minSize, r.height() * 0.85f))
+            var lines: List<String> = emptyList()
+            while (true) {
+                paint.textSize = size
+                lines = wrap(item.translated, paint, textW)
+                if (lines.size * lineHeightFor(size) <= textH + 0.5f || size <= minSize) break
+                size = max(minSize, size - 0.5f * resources.displayMetrics.scaledDensity)
             }
-            val box = RectF(left, top, left + blockWidth, top + blockHeight)
-            placed.add(Placed(box, lines))
-            maxBottom = max(maxBottom, box.bottom)
+            if (lines.isEmpty()) continue
+            // Если и минимальный шрифт не влез — обрезаем с «…», полный текст по тапу.
+            val maxLines = max(1, (textH / lineHeightFor(size)).toInt())
+            var truncated = false
+            if (lines.size > maxLines) {
+                truncated = true
+                val kept = lines.take(maxLines).toMutableList()
+                var last = kept.last()
+                while (last.isNotEmpty() && paint.measureText("$last…") > textW) last = last.dropLast(1)
+                kept[kept.size - 1] = "$last…"
+                lines = kept
+            }
+            // Подгоняем высоту рамки под реальный текст, чтобы не закрывать лишнего.
+            val usedH = lines.size * lineHeightFor(size) + 2 * pad
+            val usedW = (lines.maxOf { paint.measureText(it) } + 2 * pad)
+            val finalBox = RectF(box.left, box.top,
+                max(r.right.toFloat(), min(box.right, box.left + usedW)),
+                max(r.bottom.toFloat(), min(box.bottom, box.top + usedH)))
+            result.add(Placed(finalBox, lines, size, truncated, item))
         }
-        return placed to maxBottom
+        // Раскраска: соседние (касающиеся) блоки получают разные цвета.
+        val touch = dp(4f)
+        for ((i, b) in result.withIndex()) {
+            val used = mutableSetOf<Int>()
+            for (j in 0 until i) {
+                val o = result[j].box
+                if (RectF.intersects(RectF(b.box.left - touch, b.box.top - touch, b.box.right + touch, b.box.bottom + touch), o))
+                    used.add(result[j].color)
+            }
+            b.color = (0..3).firstOrNull { it !in used } ?: (i % 4)
+        }
+        return result
     }
 
-    private fun showResult(items: List<Pair<Rect, String>>) {
+    private fun dismissDetail() {
+        detailPanel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        detailPanel = null
+    }
+
+    private fun showDetail(item: Shown) {
+        dismissDetail()
+        val s = screenSize()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14f).toInt(), dp(10f).toInt(), dp(14f).toInt(), dp(10f).toInt())
+            setBackgroundColor(Color.argb(245, 255, 255, 255))
+            addView(TextView(this@CaptureService).apply { text = item.original; setTextColor(Color.DKGRAY); textSize = 14f })
+            addView(TextView(this@CaptureService).apply {
+                text = item.translated; setTextColor(Color.BLACK); textSize = 17f
+                setPadding(0, dp(6f).toInt(), 0, 0)
+            })
+            addView(TextView(this@CaptureService).apply { text = "нажмите, чтобы закрыть"; setTextColor(Color.GRAY); textSize = 11f })
+            setOnClickListener { dismissDetail() }
+        }
+        detailPanel = panel
+        wm.addView(panel, params(s.x, WindowManager.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply {
+            y = dp(48f).toInt()
+        })
+        bringBubbleToFront()
+    }
+
+    private fun showResult(items: List<Shown>) {
         bubble?.visibility = View.VISIBLE
         if (items.isEmpty()) { Toast.makeText(this, "Перевод не получен. Проверьте интернет и модели.", Toast.LENGTH_LONG).show(); return }
         if (prefs.getInt("mode", 0) == 0) {
@@ -508,80 +580,69 @@ class CaptureService : Service() {
             val screenW = screen.x.toFloat()
             val screenH = screen.y.toFloat()
             val sp = resources.displayMetrics.scaledDensity
-            val baseSize = prefs.getInt("size", 14).toFloat() * sp
-            val minSize = max(9f * sp, baseSize * 0.6f)
-            // Сначала уменьшаем шрифт, пока всё не влезет; если не влезло — включаем прокрутку.
-            var size = baseSize
-            var layout = layoutBlocks(items, size, screenW)
-            while (layout.second > screenH && size - sp >= minSize) {
-                size -= sp
-                layout = layoutBlocks(items, size, screenW)
-            }
-            val blocks = layout.first
-            val maxScroll = (layout.second - screenH + dp(24f)).coerceAtLeast(0f)
-            val scrollable = maxScroll > 0f
+            val maxSize = prefs.getInt("size", 14).toFloat() * sp
+            val minSize = min(maxSize, 7f * sp)
+            val blocks = layoutInPlace(items, maxSize, minSize, screenW, screenH)
             val dark = prefs.getInt("theme", 0) == 1
+            val colored = prefs.getInt("colors", 0) == 0
+            val palette = if (dark) intArrayOf(Color.rgb(20, 20, 20), Color.rgb(52, 46, 10), Color.rgb(12, 36, 62), Color.rgb(16, 50, 24))
+                          else intArrayOf(Color.WHITE, Color.rgb(255, 244, 190), Color.rgb(212, 236, 255), Color.rgb(218, 245, 208))
             val closeR = dp(18f)
             val closeCx = screenW - dp(30f)
             val closeCy = dp(64f)
 
             val view = object : View(this) {
-                var scroll = 0f
-                val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = if (dark) Color.WHITE else Color.BLACK; textSize = size }
-                val bg = Paint().apply { color = if (dark) Color.BLACK else Color.WHITE }
+                val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = if (dark) Color.WHITE else Color.BLACK }
+                val bg = Paint()
+                val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    style = Paint.Style.STROKE; strokeWidth = dp(1f)
+                    color = if (dark) Color.rgb(110, 110, 110) else Color.rgb(150, 150, 150)
+                }
+                val more = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(230, 120, 0) }
                 val closeBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(200, 60, 60, 60) }
                 val closeFg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; strokeWidth = dp(2.5f) }
-                val bar = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(160, 255, 140, 0) }
                 override fun onDraw(canvas: Canvas) {
                     val loc = IntArray(2); getLocationOnScreen(loc)
-                    canvas.save()
-                    canvas.translate(-loc[0].toFloat(), -loc[1].toFloat() - scroll)
-                    val margin = dp(4f)
-                    val lineHeight = size * 1.25f
-                    for (b in blocks) {
-                        canvas.drawRect(b.box, bg)
-                        for ((i, line) in b.lines.withIndex())
-                            canvas.drawText(line, b.box.left + margin, b.box.top + margin + size + i * lineHeight, textPaint)
-                    }
-                    canvas.restore()
-                    canvas.save()
                     canvas.translate(-loc[0].toFloat(), -loc[1].toFloat())
-                    // Кнопка закрытия
+                    val pad = dp(2f)
+                    for (b in blocks) {
+                        bg.color = if (colored) palette[b.color] else palette[0]
+                        canvas.drawRect(b.box, bg)
+                        if (colored) canvas.drawRect(b.box, border)
+                        textPaint.textSize = b.size
+                        val lh = lineHeightFor(b.size)
+                        for ((i, line) in b.lines.withIndex())
+                            canvas.drawText(line, b.box.left + pad, b.box.top + pad + b.size * 0.92f + i * lh, textPaint)
+                        // Оранжевый уголок: текст обрезан, тап покажет полностью.
+                        if (b.truncated) {
+                            val c = dp(7f)
+                            val path = Path().apply {
+                                moveTo(b.box.right, b.box.bottom - c); lineTo(b.box.right, b.box.bottom); lineTo(b.box.right - c, b.box.bottom); close()
+                            }
+                            canvas.drawPath(path, more)
+                        }
+                    }
                     canvas.drawCircle(closeCx, closeCy, closeR, closeBg)
                     val k = closeR * 0.45f
                     canvas.drawLine(closeCx - k, closeCy - k, closeCx + k, closeCy + k, closeFg)
                     canvas.drawLine(closeCx + k, closeCy - k, closeCx - k, closeCy + k, closeFg)
-                    // Полоса прокрутки
-                    if (scrollable) {
-                        val total = screenH + maxScroll
-                        val h = screenH * screenH / total
-                        val y = (screenH - h) * (scroll / maxScroll)
-                        canvas.drawRect(screenW - dp(5f), y, screenW, y + h, bar)
-                    }
-                    canvas.restore()
                 }
             }
             view.setOnTouchListener(object : View.OnTouchListener {
+                var startX = 0f
                 var startY = 0f
-                var startScroll = 0f
-                var moved = false
                 override fun onTouch(v: View, event: MotionEvent): Boolean {
                     when (event.actionMasked) {
-                        MotionEvent.ACTION_DOWN -> { startY = event.rawY; startScroll = view.scroll; moved = false }
-                        MotionEvent.ACTION_MOVE -> {
-                            if (abs(event.rawY - startY) > dp(8f)) moved = true
-                            if (scrollable) {
-                                view.scroll = (startScroll + (startY - event.rawY)).coerceIn(0f, maxScroll)
-                                view.invalidate()
-                            }
-                        }
+                        MotionEvent.ACTION_DOWN -> { startX = event.rawX; startY = event.rawY }
                         MotionEvent.ACTION_UP -> {
-                            if (!moved && hypot(event.rawX - closeCx, event.rawY - closeCy) < closeR * 1.6f) {
-                                dismissResult(); return true
+                            val tap = hypot(event.rawX - startX, event.rawY - startY) < dp(10f)
+                            if (tap && hypot(event.rawX - closeCx, event.rawY - closeCy) < closeR * 1.6f) { dismissResult(); return true }
+                            if (startY - event.rawY > dp(45f)) { dismissResult(); return true }
+                            if (tap) {
+                                // Сверху нарисованы последние блоки — ищем с конца.
+                                val hit = blocks.lastOrNull { it.box.contains(event.rawX, event.rawY) }
+                                if (hit != null) showDetail(hit.item) else dismissDetail()
                             }
-                            val swipeUp = startY - event.rawY > dp(45f)
-                            // Без прокрутки: свайп вверх закрывает. С прокруткой: свайп вверх в самом низу.
-                            if (swipeUp && (!scrollable || startScroll >= maxScroll - 1f)) dismissResult()
                         }
                     }
                     return true
@@ -590,12 +651,11 @@ class CaptureService : Service() {
             resultOverlay = view
             wm.addView(view, fullScreenParams())
             bringBubbleToFront()
-            if (scrollable) Toast.makeText(this, "Перевод не помещается — прокрутите пальцем", Toast.LENGTH_SHORT).show()
         } else {
             val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16, 12, 16, 12); setBackgroundColor(Color.WHITE) }
             layout.addView(Button(this).apply { text = "Закрыть ✕"; setOnClickListener { dismissResult() } })
             val scroll = ScrollView(this)
-            scroll.addView(TextView(this).apply { text = items.joinToString("\n\n") { it.second }; setTextColor(Color.BLACK); textSize = prefs.getInt("size", 14).toFloat() })
+            scroll.addView(TextView(this).apply { text = items.joinToString("\n\n") { it.translated }; setTextColor(Color.BLACK); textSize = prefs.getInt("size", 14).toFloat() })
             layout.addView(scroll)
             resultOverlay = layout
             val s = screenSize()
