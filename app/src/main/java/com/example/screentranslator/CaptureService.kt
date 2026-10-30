@@ -27,31 +27,50 @@ import java.net.URLEncoder
 import java.security.MessageDigest
 import org.json.JSONObject
 
+/**
+ * v0.10
+ * - Все окна поверх экрана используют экранные координаты (с учётом строки состояния и выреза),
+ *   поэтому рамка, распознанный текст и перевод совпадают по положению.
+ * - Выделение области: рамка = прямоугольник, охватывающий кнопку TR в момент удержания
+ *   и кнопку TR сейчас. Кнопка всегда остаётся на экране, а рамка достаёт до любого края.
+ * - Распознавание одним движком (по выбранному языку), без повторных проходов.
+ * - Блоки перевода больше не пропускаются: сначала уменьшается шрифт, затем включается прокрутка.
+ */
 class CaptureService : Service() {
     private lateinit var wm: WindowManager
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var display: android.hardware.display.VirtualDisplay? = null
     private var bubble: View? = null
+    private var bubbleParams: WindowManager.LayoutParams? = null
     private var resultOverlay: View? = null
-    private var selectingOverlay: View? = null
     private var busy = false
-    private var anchor: android.graphics.PointF? = null
-    private var selectionRect: Rect? = null
+    private var holdRect: Rect? = null          // кнопка TR в момент начала выделения (экранные координаты)
+    private var selectionRect: Rect? = null     // текущая рамка (экранные координаты)
     private var holdRunnable: Runnable? = null
     private var selectionHint: View? = null
     private val handler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private val languageId = LanguageIdentification.getClient()
-    private val recognizers: List<TextRecognizer> by lazy { listOf(
-        TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()),
-        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
-        TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
-        TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
-    ) }
+    private var recognizer: TextRecognizer? = null
+    private var recognizerKind = -1
     private val translators = mutableMapOf<String, Translator>()
     private data class Segment(val rect: Rect, val text: String)
+    private class Placed(val box: RectF, val lines: List<String>)
+
+    private val sourceCodes = arrayOf("auto", "zh", "en", "ja", "ko", "ru")
+    private val targetCodes = arrayOf("ru", "zh", "en", "ja", "ko")
+
     override fun onBind(intent: Intent?) = null
+
+    private fun screenSize(): Point {
+        val p = Point()
+        @Suppress("DEPRECATION") wm.defaultDisplay.getRealSize(p)
+        return p
+    }
+
+    private fun dp(v: Float) = v * resources.displayMetrics.density
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val channel = NotificationChannel("capture", "Перевод экрана", NotificationManager.IMPORTANCE_LOW)
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -60,6 +79,7 @@ class CaptureService : Service() {
         if (Build.VERSION.SDK_INT >= 29) startForeground(1, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         else startForeground(1, note)
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        if (projection != null) return START_NOT_STICKY   // уже запущен
         val data = if (Build.VERSION.SDK_INT >= 33) intent?.getParcelableExtra("data", Intent::class.java)
                    else @Suppress("DEPRECATION") intent?.getParcelableExtra<Intent>("data")
         if (data == null) { stopSelf(); return START_NOT_STICKY }
@@ -68,17 +88,29 @@ class CaptureService : Service() {
         projection?.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() { handler.post { stopSelf() } }
         }, handler)
-        val m = resources.displayMetrics
-        reader = ImageReader.newInstance(m.widthPixels, m.heightPixels, PixelFormat.RGBA_8888, 2)
-        display = projection?.createVirtualDisplay("TranslateCapture", m.widthPixels, m.heightPixels,
-            m.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler)
+        val size = screenSize()
+        reader = ImageReader.newInstance(size.x, size.y, PixelFormat.RGBA_8888, 2)
+        display = projection?.createVirtualDisplay("TranslateCapture", size.x, size.y,
+            resources.displayMetrics.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler)
         showBubble()
         return START_NOT_STICKY
     }
+
     private fun params(w: Int, h: Int, gravity: Int = Gravity.TOP or Gravity.START) =
         WindowManager.LayoutParams(w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT).apply { this.gravity = gravity }
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT).apply {
+            this.gravity = gravity
+            if (Build.VERSION.SDK_INT >= 28)
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+
+    private fun fullScreenParams(): WindowManager.LayoutParams {
+        val s = screenSize()
+        return params(s.x, s.y).apply { x = 0; y = 0 }
+    }
+
     private fun showBubble() {
         val button = Button(this).apply {
             text = "TR"
@@ -87,18 +119,21 @@ class CaptureService : Service() {
                 if (resultOverlay != null) dismissResult() else capture(null)
             }
         }
-        val side = (52f * resources.displayMetrics.density).toInt()
+        val side = dp(52f).toInt()
         val p = params(side, side).apply { x = 0; y = 220 }
-        val threshold = 12f * resources.displayMetrics.density
-        val holdMs = 2000L
+        val threshold = dp(12f)
+        val holdMs = 1000L
         button.setOnTouchListener(object : View.OnTouchListener {
             var downX = 0f
             var downY = 0f
             var oldX = 0
             var oldY = 0
+            var offX = 0      // разница между экранными координатами и координатами окна
+            var offY = 0
             var moved = false
             var lastX = 0f
             var lastY = 0f
+            fun bubbleScreenRect() = Rect(p.x + offX, p.y + offY, p.x + offX + side, p.y + offY + side)
             fun cancelHold() {
                 holdRunnable?.let { handler.removeCallbacks(it) }
                 holdRunnable = null
@@ -106,12 +141,11 @@ class CaptureService : Service() {
             fun armHold() {
                 cancelHold()
                 val task = Runnable {
-                    if (!busy && anchor == null && resultOverlay == null) {
-                        // Anchor at the bubble's top-left corner, not the finger.
-                        val x = p.x.toFloat()
-                        val y = p.y.toFloat()
-                        anchor = android.graphics.PointF(x, y)
-                        selectionRect = Rect(x.toInt(), y.toInt(), x.toInt(), y.toInt())
+                    if (!busy && holdRect == null && resultOverlay == null) {
+                        val r = bubbleScreenRect()
+                        holdRect = Rect(r)
+                        selectionRect = Rect(r)
+                        button.alpha = 0.45f
                         showSelectionHint()
                     }
                 }
@@ -124,32 +158,31 @@ class CaptureService : Service() {
                         downX = e.rawX; downY = e.rawY
                         lastX = e.rawX; lastY = e.rawY
                         oldX = p.x; oldY = p.y; moved = false
-                        anchor = null
+                        val loc = IntArray(2); v.getLocationOnScreen(loc)
+                        offX = loc[0] - p.x; offY = loc[1] - p.y
+                        holdRect = null
                         armHold()
                         return true
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val x = e.rawX; val y = e.rawY
-                        if (abs(x-lastX) > threshold || abs(y-lastY) > threshold) {
+                        if (abs(x - lastX) > threshold || abs(y - lastY) > threshold) {
                             lastX = x; lastY = y
-                            if (anchor == null) armHold()
+                            if (holdRect == null) armHold()
                         }
-                        if (abs(x-downX)>threshold || abs(y-downY)>threshold) moved = true
+                        if (abs(x - downX) > threshold || abs(y - downY) > threshold) moved = true
                         if (moved) {
-                            // Keep the real finger position even beyond the visible display.
-                            // WindowManager may clamp the visible bubble, but the selection
-                            // endpoint continues following the finger up to screen edges.
-                            p.x = oldX+(x-downX).toInt()
-                            p.y = oldY+(y-downY).toInt()
-                            wm.updateViewLayout(button,p)
+                            val s = screenSize()
+                            // Кнопка всегда целиком на экране.
+                            p.x = (oldX + (x - downX).toInt()).coerceIn(-offX, s.x - side - offX)
+                            p.y = (oldY + (y - downY).toInt()).coerceIn(-offY, s.y - side - offY)
+                            wm.updateViewLayout(button, p)
                         }
-                        anchor?.let { start ->
-                            // End point is the *virtual* top-left corner of TR, even
-                            // when the actual window is clipped at the screen edge.
-                            val endX = (oldX+(x-downX)).coerceIn(0f, resources.displayMetrics.widthPixels.toFloat())
-                            val endY = (oldY+(y-downY)).coerceIn(0f, resources.displayMetrics.heightPixels.toFloat())
-                            selectionRect = Rect(min(start.x,endX).toInt(), min(start.y,endY).toInt(),
-                                max(start.x,endX).toInt(), max(start.y,endY).toInt())
+                        holdRect?.let { start ->
+                            // Рамка охватывает кнопку в момент удержания и кнопку сейчас:
+                            // так край рамки доходит до края экрана, а кнопка не уходит за него.
+                            val r = Rect(start); r.union(bubbleScreenRect())
+                            selectionRect = r
                             selectionHint?.invalidate()
                         }
                         return true
@@ -157,30 +190,26 @@ class CaptureService : Service() {
                     MotionEvent.ACTION_UP -> {
                         cancelHold()
                         val rect = selectionRect
-                        val wasSelecting = anchor != null
-                        anchor = null
-                        removeSelectionHint()
+                        val wasSelecting = holdRect != null
+                        holdRect = null
                         selectionRect = null
-                        // On release, snap the square button back into the visible area.
-                        val maxX = (resources.displayMetrics.widthPixels-side).coerceAtLeast(0)
-                        val maxY = (resources.displayMetrics.heightPixels-side).coerceAtLeast(0)
-                        p.x = p.x.coerceIn(0,maxX)
-                        p.y = p.y.coerceIn(0,maxY)
-                        wm.updateViewLayout(button,p)
+                        removeSelectionHint()
+                        button.alpha = 1f
                         if (wasSelecting) {
-                            if (rect != null && rect.width()>30 && rect.height()>30) {
+                            if (rect != null && rect.width() > side + 10 || rect != null && rect.height() > side + 10) {
                                 dismissResult()
                                 capture(rect)
                             }
                         } else if (!moved) {
                             v.performClick()
-                        } else if (e.rawY-downY < -65f*resources.displayMetrics.density && resultOverlay != null) {
+                        } else if (e.rawY - downY < -dp(65f) && resultOverlay != null) {
                             dismissResult()
                         }
                         return true
                     }
                     MotionEvent.ACTION_CANCEL -> {
-                        cancelHold(); anchor = null; selectionRect = null; removeSelectionHint()
+                        cancelHold(); holdRect = null; selectionRect = null; removeSelectionHint()
+                        button.alpha = 1f
                         return true
                     }
                 }
@@ -188,35 +217,62 @@ class CaptureService : Service() {
             }
         })
         bubble = button
-        wm.addView(button,p)
+        bubbleParams = p
+        wm.addView(button, p)
     }
+
+    /** Поднять кнопку TR над окном перевода, чтобы её можно было нажать для закрытия. */
+    private fun bringBubbleToFront() {
+        val b = bubble ?: return
+        val p = bubbleParams ?: return
+        try { wm.removeView(b); wm.addView(b, p) } catch (_: Exception) {}
+    }
+
     private fun dismissResult() {
         resultOverlay?.let { try { wm.removeView(it) } catch (_: IllegalArgumentException) {} }
         resultOverlay = null
     }
+
     private fun removeSelectionHint() {
         selectionHint?.let { try { wm.removeView(it) } catch (_: IllegalArgumentException) {} }
         selectionHint = null
     }
+
     private fun showSelectionHint() {
-        val density = resources.displayMetrics.density
         val overlay = object : View(this) {
-            private val outline = Paint(3).apply {
-                color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = 2f*density
+            private val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = dp(2f)
             }
-            private val marker = Paint(3).apply { color = Color.YELLOW; textSize = 20f*density }
+            private val fill = Paint().apply { color = Color.argb(40, 255, 255, 0) }
+            private val ghost = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = dp(1f)
+                pathEffect = DashPathEffect(floatArrayOf(dp(4f), dp(4f)), 0f)
+            }
+            private val corner = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.RED; style = Paint.Style.STROKE; strokeWidth = dp(4f)
+            }
             override fun onDraw(canvas: Canvas) {
-                val start = anchor ?: return
-                canvas.drawText("➤",start.x,start.y + 14f*density,marker)
-                selectionRect?.let { canvas.drawRect(it,outline) }
+                val loc = IntArray(2); getLocationOnScreen(loc)
+                canvas.translate(-loc[0].toFloat(), -loc[1].toFloat())
+                holdRect?.let { canvas.drawRect(it, ghost) }
+                val r = selectionRect ?: return
+                canvas.drawRect(r, fill)
+                canvas.drawRect(r, outline)
+                // Красные уголки, чтобы точно видеть границы рамки.
+                val c = dp(14f)
+                val l = r.left.toFloat(); val t = r.top.toFloat(); val rr = r.right.toFloat(); val b = r.bottom.toFloat()
+                canvas.drawLine(l, t, l + c, t, corner); canvas.drawLine(l, t, l, t + c, corner)
+                canvas.drawLine(rr, t, rr - c, t, corner); canvas.drawLine(rr, t, rr, t + c, corner)
+                canvas.drawLine(l, b, l + c, b, corner); canvas.drawLine(l, b, l, b - c, corner)
+                canvas.drawLine(rr, b, rr - c, b, corner); canvas.drawLine(rr, b, rr, b - c, corner)
             }
         }
         selectionHint = overlay
-        val m = resources.displayMetrics
-        wm.addView(overlay,params(m.widthPixels,m.heightPixels).apply {
+        wm.addView(overlay, fullScreenParams().apply {
             flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         })
     }
+
     private fun capture(region: Rect?) {
         if (busy) return
         busy = true
@@ -235,46 +291,55 @@ class CaptureService : Service() {
             } catch (e: Exception) { fail("Ошибка кадра: ${e.message}") }
             finally { image.close() }
             val shot = bitmap ?: return@postDelayed
-            recognizeAll(shot, region)
+            // Для выделенной области распознаём только её — быстрее и без лишнего текста.
+            if (region != null) {
+                val r = Rect(region)
+                if (!r.intersect(0, 0, shot.width, shot.height) || r.width() < 8 || r.height() < 8) {
+                    shot.recycle(); fail("Область слишком мала"); return@postDelayed
+                }
+                val crop = Bitmap.createBitmap(shot, r.left, r.top, r.width(), r.height())
+                if (crop != shot) shot.recycle()
+                recognize(crop, r.left, r.top)
+            } else recognize(shot, 0, 0)
         }, 550)
     }
-    private fun recognizeAll(bitmap: Bitmap, region: Rect?) {
-        val segments = mutableListOf<Segment>()
-        val input = InputImage.fromBitmap(bitmap, 0)
-        fun next(index: Int) {
-            if (index == recognizers.size) {
-                bitmap.recycle()
-                val unique = segments.distinctBy { "${it.rect.left/12}:${it.rect.top/12}:${it.text.trim()}" }
-                if (unique.isEmpty()) { fail("Текст не найден"); return }
-                translateAll(unique)
-                return
-            }
-            recognizers[index].process(input).addOnSuccessListener { result ->
-                for (line in result.textBlocks.flatMap { it.lines }) {
-                    val rect = line.boundingBox ?: continue
-                    if (line.text.isNotBlank() && (region == null || Rect.intersects(rect, region))) {
-                        // Keep first recognized text for overlapping scripts.
-                        if (segments.none { existing -> overlap(existing.rect,rect) > 0.65f })
-                            segments.add(Segment(Rect(rect), line.text))
-                    }
-                }
-            }.addOnCompleteListener { next(index+1) }
+
+    /** Один движок распознавания по выбранному языку оригинала. Китайский движок читает и латиницу. */
+    private fun recognizerFor(source: String): TextRecognizer {
+        val kind = when (source) { "ja" -> 2; "ko" -> 3; "en", "ru" -> 1; else -> 0 }
+        recognizer?.let { if (recognizerKind == kind) return it; it.close() }
+        val r = when (kind) {
+            1 -> TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            2 -> TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+            3 -> TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+            else -> TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
         }
-        next(0)
+        recognizer = r; recognizerKind = kind
+        return r
     }
-    private fun overlap(a: Rect,b: Rect): Float {
-        val i=Rect(a)
-        if(!i.intersect(b)) return 0f
-        return i.width().toFloat()*i.height() / max(1f,min(a.width().toFloat()*a.height(),b.width().toFloat()*b.height()))
+
+    private fun recognize(bitmap: Bitmap, dx: Int, dy: Int) {
+        val source = sourceCodes[prefs.getInt("source", 0).coerceIn(sourceCodes.indices)]
+        recognizerFor(source).process(InputImage.fromBitmap(bitmap, 0))
+            .addOnSuccessListener { result ->
+                val segments = mutableListOf<Segment>()
+                for (line in result.textBlocks.flatMap { it.lines }) {
+                    val box = line.boundingBox ?: continue
+                    if (line.text.isBlank()) continue
+                    val rect = Rect(box); rect.offset(dx, dy)
+                    segments.add(Segment(rect, line.text))
+                }
+                if (segments.isEmpty()) fail("Текст не найден") else translateAll(segments)
+            }
+            .addOnFailureListener { fail("Ошибка распознавания: ${it.message}") }
+            .addOnCompleteListener { bitmap.recycle() }
     }
-    private val sourceCodes = arrayOf("auto", "zh", "en", "ja", "ko", "ru")
-    private val targetCodes = arrayOf("ru", "zh", "en", "ja", "ko")
 
     private fun translateAll(items: List<Segment>) {
-        val output = mutableListOf<Pair<Rect,String>>()
-        val provider = prefs.getInt("provider",0)
-        val configuredSource = sourceCodes[prefs.getInt("source",0).coerceIn(sourceCodes.indices)]
-        val target = targetCodes[prefs.getInt("target",0).coerceIn(targetCodes.indices)]
+        val output = mutableListOf<Pair<Rect, String>>()
+        val provider = prefs.getInt("provider", 0)
+        val configuredSource = sourceCodes[prefs.getInt("source", 0).coerceIn(sourceCodes.indices)]
+        val target = targetCodes[prefs.getInt("target", 0).coerceIn(targetCodes.indices)]
         fun next(i: Int) {
             if (i >= items.size) {
                 busy = false
@@ -284,7 +349,7 @@ class CaptureService : Service() {
             }
             val item = items[i]
             fun translate(source: String) {
-                if (source == target) { next(i+1); return }
+                if (source == target) { output.add(item.rect to item.text); next(i + 1); return }
                 if (provider == 0) {
                     val key = "$source:$target"
                     val translator = try {
@@ -292,13 +357,13 @@ class CaptureService : Service() {
                             Translation.getClient(TranslatorOptions.Builder()
                                 .setSourceLanguage(source).setTargetLanguage(target).build())
                         }
-                    } catch (e: Exception) { next(i+1); return }
+                    } catch (e: Exception) { next(i + 1); return }
                     translator.downloadModelIfNeeded().addOnSuccessListener {
                         translator.translate(item.text).addOnSuccessListener { result ->
                             output.add(item.rect to result)
-                            next(i+1)
-                        }.addOnFailureListener { next(i+1) }
-                    }.addOnFailureListener { next(i+1) }
+                            next(i + 1)
+                        }.addOnFailureListener { next(i + 1) }
+                    }.addOnFailureListener { next(i + 1) }
                 } else {
                     Thread {
                         val result = try {
@@ -310,7 +375,7 @@ class CaptureService : Service() {
                         }
                         handler.post {
                             if (result != null) output.add(item.rect to result)
-                            next(i+1)
+                            next(i + 1)
                         }
                     }.start()
                 }
@@ -318,9 +383,9 @@ class CaptureService : Service() {
             if (configuredSource != "auto") translate(configuredSource)
             else languageId.identifyLanguage(item.text).addOnSuccessListener { code ->
                 val source = when {
+                    item.text.any { it.code in 0x4E00..0x9FFF } && !item.text.any { it.code in 0x3040..0x30FF } -> "zh"
                     code.startsWith("zh") -> "zh"
-                    code in arrayOf("en","ja","ko","ru") -> code
-                    item.text.any { it.code in 0x4E00..0x9FFF } -> "zh"
+                    code in arrayOf("en", "ja", "ko", "ru") -> code
                     else -> "en"
                 }
                 translate(source)
@@ -329,9 +394,9 @@ class CaptureService : Service() {
         next(0)
     }
 
-    private fun postForm(endpoint: String, params: Map<String,String>): JSONObject {
+    private fun postForm(endpoint: String, params: Map<String, String>): JSONObject {
         val payload = params.entries.joinToString("&") {
-            URLEncoder.encode(it.key,"UTF-8")+"="+URLEncoder.encode(it.value,"UTF-8")
+            URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
         }
         val conn = URL(endpoint).openConnection() as HttpURLConnection
         try {
@@ -339,7 +404,7 @@ class CaptureService : Service() {
             conn.connectTimeout = 12000
             conn.readTimeout = 15000
             conn.doOutput = true
-            conn.setRequestProperty("Content-Type","application/x-www-form-urlencoded; charset=UTF-8")
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
             val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
             val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
@@ -349,13 +414,13 @@ class CaptureService : Service() {
     }
 
     private fun googleTranslate(text: String, source: String, target: String): String {
-        val key = prefs.getString("google_key","").orEmpty()
+        val key = prefs.getString("google_key", "").orEmpty()
         if (key.isBlank()) throw Exception("Не задан Google Cloud API key")
-        val response = postForm("https://translation.googleapis.com/language/translate/v2?key="+
-            URLEncoder.encode(key,"UTF-8"),
+        val response = postForm("https://translation.googleapis.com/language/translate/v2?key=" +
+            URLEncoder.encode(key, "UTF-8"),
             buildMap {
-                put("q",text); put("target",target); put("format","text")
-                if (source != "auto") put("source",source)
+                put("q", text); put("target", target); put("format", "text")
+                if (source != "auto") put("source", source)
             })
         return android.text.Html.fromHtml(
             response.getJSONObject("data").getJSONArray("translations")
@@ -364,128 +429,188 @@ class CaptureService : Service() {
     }
 
     private fun baiduTranslate(text: String, source: String, target: String): String {
-        val appid = prefs.getString("baidu_appid","").orEmpty()
-        val secret = prefs.getString("baidu_secret","").orEmpty()
+        val appid = prefs.getString("baidu_appid", "").orEmpty()
+        val secret = prefs.getString("baidu_secret", "").orEmpty()
         if (appid.isBlank() || secret.isBlank()) throw Exception("Не заданы Baidu App ID / Secret")
         val salt = System.currentTimeMillis().toString()
-        val raw = appid+text+salt+secret
+        val raw = appid + text + salt + secret
         val sign = MessageDigest.getInstance("MD5").digest(raw.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it.toInt() and 255) }
         val result = postForm("https://fanyi-api.baidu.com/api/trans/vip/translate",
-            mapOf("q" to text,"from" to source,"to" to target,
-                "appid" to appid,"salt" to salt,"sign" to sign))
+            mapOf("q" to text, "from" to source, "to" to target,
+                "appid" to appid, "salt" to salt, "sign" to sign))
         if (result.has("error_code")) throw Exception("Baidu ${result.optString("error_code")}: ${result.optString("error_msg")}")
         return result.getJSONArray("trans_result").getJSONObject(0).getString("dst")
     }
-    private fun fail(message: String) { busy=false;bubble?.visibility=View.VISIBLE;Toast.makeText(this,message,Toast.LENGTH_LONG).show() }
-    private fun showResult(items: List<Pair<Rect,String>>) {
-        bubble?.visibility=View.VISIBLE
-        if (items.isEmpty()) { Toast.makeText(this,"Перевод не получен. Проверьте интернет и модели.",Toast.LENGTH_LONG).show();return }
-        if (prefs.getInt("mode",0)==0) {
-            val size = prefs.getInt("size",14).toFloat()*resources.displayMetrics.scaledDensity
-            val dark = prefs.getInt("theme",0)==1
-            val view=object : View(this) {
-                val textPaint=Paint(3).apply { color=if(dark) Color.WHITE else Color.BLACK; textSize=size }
-                val bg=Paint().apply { color=if(dark) Color.BLACK else Color.WHITE }
-                override fun onDraw(canvas: Canvas) {
-                    // Lay out translated blocks in reading order, reserving the
-                    // actual wrapped height of each block before drawing the next.
-                    // This prevents overlapping labels when Russian is longer.
-                    val ordered = items.sortedWith(compareBy<Pair<Rect,String>> { it.first.top }.thenBy { it.first.left })
-                    val occupied = mutableListOf<RectF>()
-                    val margin = 5f * resources.displayMetrics.density
-                    val lineHeight = size * 1.3f
-                    val screenW = width.toFloat()
-                    val screenH = height.toFloat()
-                    for ((rect, translated) in ordered) {
-                        val left = rect.left.toFloat().coerceIn(0f,(screenW-size*5).coerceAtLeast(0f))
-                        // Allow more horizontal space than the narrow original Chinese line.
-                        val desiredWidth = max(rect.width().toFloat(), min(screenW*0.82f, size*21f))
-                        val blockWidth = min(desiredWidth, screenW-left-margin).coerceAtLeast(size*2f)
-                        val textWidth = (blockWidth-2f*margin).coerceAtLeast(size)
-                        val lines = mutableListOf<String>()
-                        var current = ""
-                        fun flushLine() { if (current.isNotEmpty()) { lines.add(current); current="" } }
-                        for (paragraph in translated.split('\n')) {
-                            for (word in paragraph.split(Regex("\\s+"))) {
-                                if (word.isEmpty()) continue
-                                val candidate = if (current.isEmpty()) word else "$current $word"
-                                if (textPaint.measureText(candidate) <= textWidth) { current = candidate; continue }
-                                flushLine()
-                                // Break even a single long unspaced word if necessary.
-                                for (char in word) {
-                                    val attempt = current+char
-                                    if (current.isNotEmpty() && textPaint.measureText(attempt)>textWidth) flushLine()
-                                    current += char
-                                }
-                            }
-                            flushLine()
-                        }
-                        if (lines.isEmpty()) continue
-                        val blockHeight = lines.size*lineHeight+2f*margin
-                        var top = rect.top.toFloat().coerceAtLeast(0f)
-                        // Search for a non-overlapping slot, including across columns.
-                        var attempts = 0
-                        while (attempts++ < ordered.size+4) {
-                            val candidate = RectF(left,top,left+blockWidth,top+blockHeight)
-                            val collision = occupied.firstOrNull { RectF.intersects(it,candidate) }
-                            if (collision == null) break
-                            top = collision.bottom+2f
-                        }
-                        // If bottom space is exhausted, find a free slot from the top.
-                        if (top+blockHeight>screenH) {
-                            top=0f
-                            var tries=0
-                            while (tries++<ordered.size+4) {
-                                val candidate=RectF(left,top,left+blockWidth,top+blockHeight)
-                                val collision=occupied.firstOrNull { RectF.intersects(it,candidate) }
-                                if (collision==null) break
-                                top=collision.bottom+2f
-                            }
-                        }
-                        // No room: do not paint on top of another translated block.
-                        if (top+blockHeight>screenH) continue
-                        val box=RectF(left,top,left+blockWidth,top+blockHeight)
-                        occupied.add(box)
-                        canvas.drawRect(box,bg)
-                        for ((index,line) in lines.withIndex()) {
-                            canvas.drawText(line,left+margin,top+margin+size+index*lineHeight,textPaint)
-                        }
-                    }
+
+    private fun fail(message: String) {
+        busy = false
+        bubble?.visibility = View.VISIBLE
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    // ---------- Раскладка перевода поверх текста ----------
+
+    private fun wrap(text: String, paint: Paint, width: Float): List<String> {
+        val lines = mutableListOf<String>()
+        var current = ""
+        fun flush() { if (current.isNotEmpty()) { lines.add(current); current = "" } }
+        for (paragraph in text.split('\n')) {
+            for (word in paragraph.split(Regex("\\s+"))) {
+                if (word.isEmpty()) continue
+                val candidate = if (current.isEmpty()) word else "$current $word"
+                if (paint.measureText(candidate) <= width) { current = candidate; continue }
+                flush()
+                for (ch in word) {
+                    if (current.isNotEmpty() && paint.measureText(current + ch) > width) flush()
+                    current += ch
                 }
             }
-            // Swipe UP on the translation layer to dismiss it (as in v0.5).
+            flush()
+        }
+        return lines
+    }
+
+    /** Раскладывает все блоки без пропусков и без наложений. Возвращает блоки и нижнюю границу. */
+    private fun layoutBlocks(items: List<Pair<Rect, String>>, size: Float, screenW: Float): Pair<List<Placed>, Float> {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = size }
+        val ordered = items.sortedWith(compareBy<Pair<Rect, String>> { it.first.top }.thenBy { it.first.left })
+        val placed = mutableListOf<Placed>()
+        val margin = dp(4f)
+        val lineHeight = size * 1.25f
+        var maxBottom = 0f
+        for ((rect, translated) in ordered) {
+            val left = rect.left.toFloat().coerceIn(0f, (screenW - size * 5).coerceAtLeast(0f))
+            val desiredWidth = max(rect.width().toFloat(), min(screenW * 0.82f, size * 21f))
+            val blockWidth = min(desiredWidth, screenW - left).coerceAtLeast(size * 2f)
+            val lines = wrap(translated, paint, (blockWidth - 2f * margin).coerceAtLeast(size))
+            if (lines.isEmpty()) continue
+            val blockHeight = lines.size * lineHeight + 2f * margin
+            var top = rect.top.toFloat().coerceAtLeast(0f)
+            var guard = 0
+            while (guard++ < 1000) {
+                val candidate = RectF(left, top, left + blockWidth, top + blockHeight)
+                val hit = placed.firstOrNull { RectF.intersects(it.box, candidate) } ?: break
+                top = hit.box.bottom + 1f
+            }
+            val box = RectF(left, top, left + blockWidth, top + blockHeight)
+            placed.add(Placed(box, lines))
+            maxBottom = max(maxBottom, box.bottom)
+        }
+        return placed to maxBottom
+    }
+
+    private fun showResult(items: List<Pair<Rect, String>>) {
+        bubble?.visibility = View.VISIBLE
+        if (items.isEmpty()) { Toast.makeText(this, "Перевод не получен. Проверьте интернет и модели.", Toast.LENGTH_LONG).show(); return }
+        if (prefs.getInt("mode", 0) == 0) {
+            val screen = screenSize()
+            val screenW = screen.x.toFloat()
+            val screenH = screen.y.toFloat()
+            val sp = resources.displayMetrics.scaledDensity
+            val baseSize = prefs.getInt("size", 14).toFloat() * sp
+            val minSize = max(9f * sp, baseSize * 0.6f)
+            // Сначала уменьшаем шрифт, пока всё не влезет; если не влезло — включаем прокрутку.
+            var size = baseSize
+            var layout = layoutBlocks(items, size, screenW)
+            while (layout.second > screenH && size - sp >= minSize) {
+                size -= sp
+                layout = layoutBlocks(items, size, screenW)
+            }
+            val blocks = layout.first
+            val maxScroll = (layout.second - screenH + dp(24f)).coerceAtLeast(0f)
+            val scrollable = maxScroll > 0f
+            val dark = prefs.getInt("theme", 0) == 1
+            val closeR = dp(18f)
+            val closeCx = screenW - dp(30f)
+            val closeCy = dp(64f)
+
+            val view = object : View(this) {
+                var scroll = 0f
+                val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = if (dark) Color.WHITE else Color.BLACK; textSize = size }
+                val bg = Paint().apply { color = if (dark) Color.BLACK else Color.WHITE }
+                val closeBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(200, 60, 60, 60) }
+                val closeFg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; strokeWidth = dp(2.5f) }
+                val bar = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(160, 255, 140, 0) }
+                override fun onDraw(canvas: Canvas) {
+                    val loc = IntArray(2); getLocationOnScreen(loc)
+                    canvas.save()
+                    canvas.translate(-loc[0].toFloat(), -loc[1].toFloat() - scroll)
+                    val margin = dp(4f)
+                    val lineHeight = size * 1.25f
+                    for (b in blocks) {
+                        canvas.drawRect(b.box, bg)
+                        for ((i, line) in b.lines.withIndex())
+                            canvas.drawText(line, b.box.left + margin, b.box.top + margin + size + i * lineHeight, textPaint)
+                    }
+                    canvas.restore()
+                    canvas.save()
+                    canvas.translate(-loc[0].toFloat(), -loc[1].toFloat())
+                    // Кнопка закрытия
+                    canvas.drawCircle(closeCx, closeCy, closeR, closeBg)
+                    val k = closeR * 0.45f
+                    canvas.drawLine(closeCx - k, closeCy - k, closeCx + k, closeCy + k, closeFg)
+                    canvas.drawLine(closeCx + k, closeCy - k, closeCx - k, closeCy + k, closeFg)
+                    // Полоса прокрутки
+                    if (scrollable) {
+                        val total = screenH + maxScroll
+                        val h = screenH * screenH / total
+                        val y = (screenH - h) * (scroll / maxScroll)
+                        canvas.drawRect(screenW - dp(5f), y, screenW, y + h, bar)
+                    }
+                    canvas.restore()
+                }
+            }
             view.setOnTouchListener(object : View.OnTouchListener {
                 var startY = 0f
+                var startScroll = 0f
+                var moved = false
                 override fun onTouch(v: View, event: MotionEvent): Boolean {
                     when (event.actionMasked) {
-                        MotionEvent.ACTION_DOWN -> { startY = event.rawY; return true }
+                        MotionEvent.ACTION_DOWN -> { startY = event.rawY; startScroll = view.scroll; moved = false }
+                        MotionEvent.ACTION_MOVE -> {
+                            if (abs(event.rawY - startY) > dp(8f)) moved = true
+                            if (scrollable) {
+                                view.scroll = (startScroll + (startY - event.rawY)).coerceIn(0f, maxScroll)
+                                view.invalidate()
+                            }
+                        }
                         MotionEvent.ACTION_UP -> {
-                            if (startY-event.rawY > 45f*resources.displayMetrics.density) dismissResult()
-                            return true
+                            if (!moved && hypot(event.rawX - closeCx, event.rawY - closeCy) < closeR * 1.6f) {
+                                dismissResult(); return true
+                            }
+                            val swipeUp = startY - event.rawY > dp(45f)
+                            // Без прокрутки: свайп вверх закрывает. С прокруткой: свайп вверх в самом низу.
+                            if (swipeUp && (!scrollable || startScroll >= maxScroll - 1f)) dismissResult()
                         }
                     }
                     return true
                 }
             })
-            resultOverlay=view
-            wm.addView(view,params(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.MATCH_PARENT))
+            resultOverlay = view
+            wm.addView(view, fullScreenParams())
+            bringBubbleToFront()
+            if (scrollable) Toast.makeText(this, "Перевод не помещается — прокрутите пальцем", Toast.LENGTH_SHORT).show()
         } else {
-            val layout=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(16,12,16,12);setBackgroundColor(Color.WHITE) }
-            layout.addView(Button(this).apply { text="Закрыть ✕";setOnClickListener { dismissResult() } })
-            val scroll=ScrollView(this)
-            scroll.addView(TextView(this).apply { text=items.joinToString("\n\n") { it.second };setTextColor(Color.BLACK);textSize=prefs.getInt("size",14).toFloat() })
+            val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16, 12, 16, 12); setBackgroundColor(Color.WHITE) }
+            layout.addView(Button(this).apply { text = "Закрыть ✕"; setOnClickListener { dismissResult() } })
+            val scroll = ScrollView(this)
+            scroll.addView(TextView(this).apply { text = items.joinToString("\n\n") { it.second }; setTextColor(Color.BLACK); textSize = prefs.getInt("size", 14).toFloat() })
             layout.addView(scroll)
-            resultOverlay=layout
-            wm.addView(layout,params(resources.displayMetrics.widthPixels*9/10,resources.displayMetrics.heightPixels/2,Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+            resultOverlay = layout
+            val s = screenSize()
+            wm.addView(layout, params(s.x * 9 / 10, s.y / 2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+            bringBubbleToFront()
         }
     }
+
     override fun onDestroy() {
         holdRunnable?.let { handler.removeCallbacks(it) }
         removeSelectionHint()
-        selectingOverlay?.let { wm.removeView(it) };dismissResult();bubble?.let { wm.removeView(it) }
-        display?.release();reader?.close();projection?.stop();recognizers.forEach { it.close() }
-        languageId.close();translators.values.forEach { it.close() }
+        dismissResult()
+        bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        display?.release(); reader?.close(); projection?.stop(); recognizer?.close()
+        languageId.close(); translators.values.forEach { it.close() }
         super.onDestroy()
     }
 }

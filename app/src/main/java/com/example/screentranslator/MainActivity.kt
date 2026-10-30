@@ -17,8 +17,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 36, 28, 24) }
         val scroll = ScrollView(this).apply { addView(root) }
-        root.addView(TextView(this).apply { text = "Screen Translator v0.8"; textSize = 24f })
-        root.addView(TextView(this).apply { text = "Одно нажатие TR — весь экран. Перетащите TR, остановитесь на 2 секунды и растяните область."; textSize = 15f })
+        root.addView(TextView(this).apply { text = "Screen Translator v" + packageManager.getPackageInfo(packageName, 0).versionName; textSize = 24f })
+        root.addView(TextView(this).apply { text = "Одно нажатие TR — весь экран. Выделение области: перетащите TR к углу текста, подержите 1 секунду неподвижно (появится жёлтая рамка), затем тяните TR к противоположному углу. Рамка охватывает кнопку целиком, поэтому достаёт до любого края экрана."; textSize = 15f })
         fun spinner(title: String, items: Array<String>, key: String, default: Int) {
             root.addView(TextView(this).apply { text = title; textSize = 16f; setPadding(0, 18, 0, 0) })
             val sp = Spinner(this)
@@ -100,7 +100,7 @@ class MainActivity : Activity() {
             startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), requestCapture)
         } })
         root.addView(Button(this).apply { text = "Остановить"; setOnClickListener { stopService(Intent(this@MainActivity, CaptureService::class.java)) } })
-        root.addView(TextView(this).apply { text = "TR: нажать — весь экран; перетащить, остановиться на 2 секунды, затем растянуть область. Свайп вверх по переводу закрывает его."; textSize = 14f })
+        root.addView(TextView(this).apply { text = "Закрыть перевод: нажать TR, крестик справа вверху или свайп вверх. Если перевод не помещается, его можно прокрутить пальцем.\n\nЯзык оригинала «Авто» и «Китайский» используют китайское распознавание (оно читает и латиницу). Для японского и корейского выберите язык явно. Русский текст в оригинале распознаётся плохо: ML Kit не поддерживает кириллицу.\n\nXiaomi/MIUI: в настройках приложения включите «Отображать всплывающие окна, когда запущено в фоновом режиме» и «Всплывающие окна», а в «Контроле активности» выберите «Нет ограничений»."; textSize = 14f })
         setContentView(scroll)
     }
     @Deprecated("Legacy result API")
