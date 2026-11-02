@@ -13,6 +13,26 @@ import com.google.mlkit.nl.translate.*
 class MainActivity : Activity() {
     private val requestCapture = 1001
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+    private var assistStatus: TextView? = null
+
+    /** Включена ли служба «перевод ввода» в настройках специальных возможностей. */
+    private fun isAssistEnabled(): Boolean {
+        val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+        return enabled.split(':').any {
+            val c = ComponentName.unflattenFromString(it)
+            c != null && c.packageName == packageName && c.className == InputAssistService::class.java.name
+        }
+    }
+
+    private fun updateAssistStatus() {
+        assistStatus?.text = if (isAssistEnabled()) "Перевод ввода: включён ✓"
+            else "Перевод ввода: выключен. Нажмите кнопку ниже и включите «Экранный переводчик: перевод ввода»."
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateAssistStatus()
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 36, 28, 24) }
@@ -101,6 +121,19 @@ class MainActivity : Activity() {
             startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), requestCapture)
         } })
         root.addView(Button(this).apply { text = "Остановить"; setOnClickListener { stopService(Intent(this@MainActivity, CaptureService::class.java)) } })
+        root.addView(TextView(this).apply {
+            text = "Перевод ввода: когда вы печатаете в другом приложении, под TR появляется кнопка «RU→ZH». " +
+                "Она переводит введённый текст на язык оригинала и вставляет его в поле. Если поле не принимает текст, " +
+                "откроется окно с переводом, и он будет скопирован в буфер обмена."
+            textSize = 14f; setPadding(0, 24, 0, 0)
+        })
+        assistStatus = TextView(this).apply { textSize = 14f }
+        root.addView(assistStatus)
+        root.addView(Button(this).apply { text = "3. Включить перевод ввода (спец. возможности)"; setOnClickListener {
+            Toast.makeText(this@MainActivity, "Найдите «Экранный переводчик: перевод ввода» (в MIUI: «Скачанные приложения») и включите", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } })
+        updateAssistStatus()
         root.addView(TextView(this).apply { text = "Закрыть перевод: нажать TR, крестик справа вверху или свайп вверх. Тап по блоку перевода — полный оригинал и перевод внизу экрана. Оранжевый уголок означает, что текст в блоке обрезан.\n\nЯзык оригинала «Авто» и «Китайский» используют китайское распознавание (оно читает и латиницу). Для японского и корейского выберите язык явно. Русский текст в оригинале распознаётся плохо: ML Kit не поддерживает кириллицу.\n\nXiaomi/MIUI: в настройках приложения включите «Отображать всплывающие окна, когда запущено в фоновом режиме» и «Всплывающие окна», а в «Контроле активности» выберите «Нет ограничений»."; textSize = 14f })
         setContentView(scroll)
     }

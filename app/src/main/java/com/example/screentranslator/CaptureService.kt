@@ -28,6 +28,7 @@ import java.security.MessageDigest
 import org.json.JSONObject
 
 /**
+ * v0.12: кнопка «RU→ZH» при вводе текста — переводит введённое на язык оригинала и вставляет в поле.
  * v0.11: перевод стоит на месте оригинала (вписывается в его рамку, шрифт уменьшается),
  *   соседние блоки разделены цветом, тап по блоку — полный текст.
  * v0.10
@@ -39,6 +40,15 @@ import org.json.JSONObject
  * - Блоки перевода больше не пропускаются: сначала уменьшается шрифт, затем включается прокрутка.
  */
 class CaptureService : Service() {
+    companion object {
+        @Volatile var instance: CaptureService? = null
+            private set
+    }
+    private var inputButton: Button? = null
+    private var inputParams: WindowManager.LayoutParams? = null
+    private var inputActive = false
+    private var inputBusy = false
+    private var fallbackWindow: View? = null
     private lateinit var wm: WindowManager
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
@@ -98,6 +108,9 @@ class CaptureService : Service() {
         display = projection?.createVirtualDisplay("TranslateCapture", size.x, size.y,
             resources.displayMetrics.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler)
         showBubble()
+        instance = this
+        // Если служба ввода уже включена — сразу узнать, открыто ли поле ввода.
+        handler.postDelayed({ InputAssistService.instance?.let { setInputActive(it.readFocusedText() != null) } }, 300)
         return START_NOT_STICKY
     }
 
@@ -152,6 +165,7 @@ class CaptureService : Service() {
                         selectionRect = Rect(r)
                         button.alpha = 0.45f
                         showSelectionHint()
+                        updateInputButton()
                     }
                 }
                 holdRunnable = task
@@ -182,6 +196,7 @@ class CaptureService : Service() {
                             p.x = (oldX + (x - downX).toInt()).coerceIn(-offX, s.x - side - offX)
                             p.y = (oldY + (y - downY).toInt()).coerceIn(-offY, s.y - side - offY)
                             wm.updateViewLayout(button, p)
+                            positionInputButton()
                         }
                         holdRect?.let { start ->
                             // Рамка охватывает кнопку в момент удержания и кнопку сейчас:
@@ -200,6 +215,7 @@ class CaptureService : Service() {
                         selectionRect = null
                         removeSelectionHint()
                         button.alpha = 1f
+                        updateInputButton()
                         if (wasSelecting) {
                             if (rect != null && rect.width() > side + 10 || rect != null && rect.height() > side + 10) {
                                 dismissResult()
@@ -231,6 +247,9 @@ class CaptureService : Service() {
         val b = bubble ?: return
         val p = bubbleParams ?: return
         try { wm.removeView(b); wm.addView(b, p) } catch (_: Exception) {}
+        val ib = inputButton ?: return
+        val ip = inputParams ?: return
+        try { wm.removeView(ib); wm.addView(ib, ip) } catch (_: Exception) {}
     }
 
     private fun dismissResult() {
@@ -283,6 +302,7 @@ class CaptureService : Service() {
         if (busy) return
         busy = true
         bubble?.visibility = View.INVISIBLE
+        updateInputButton()
         handler.postDelayed({
             val image = reader?.acquireLatestImage()
             if (image == null) { fail("Не удалось получить кадр"); return@postDelayed }
@@ -346,15 +366,19 @@ class CaptureService : Service() {
         val provider = prefs.getInt("provider", 0)
         val configuredSource = sourceCodes[prefs.getInt("source", 0).coerceIn(sourceCodes.indices)]
         val target = targetCodes[prefs.getInt("target", 0).coerceIn(targetCodes.indices)]
+        val detected = mutableMapOf<String, Int>()
         fun next(i: Int) {
             if (i >= items.size) {
                 busy = false
+                // Запомнить язык оригинала (для «Авто») — на него переводится введённый текст.
+                detected.maxByOrNull { it.value }?.let { prefs.edit().putString("last_source", it.key).apply() }
                 if (output.isEmpty()) fail("Перевод не получен. Проверьте язык, API-ключ и подключение.")
                 else showResult(output)
                 return
             }
             val item = items[i]
             fun translate(source: String) {
+                detected[source] = (detected[source] ?: 0) + 1
                 if (source == target) { output.add(Shown(item.rect, item.text, item.text)); next(i + 1); return }
                 if (provider == 0) {
                     val key = "$source:$target"
@@ -452,6 +476,7 @@ class CaptureService : Service() {
     private fun fail(message: String) {
         busy = false
         bubble?.visibility = View.VISIBLE
+        updateInputButton()
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
@@ -574,6 +599,7 @@ class CaptureService : Service() {
 
     private fun showResult(items: List<Shown>) {
         bubble?.visibility = View.VISIBLE
+        updateInputButton()
         if (items.isEmpty()) { Toast.makeText(this, "Перевод не получен. Проверьте интернет и модели.", Toast.LENGTH_LONG).show(); return }
         if (prefs.getInt("mode", 0) == 0) {
             val screen = screenSize()
@@ -664,7 +690,196 @@ class CaptureService : Service() {
         }
     }
 
+    // ---------- Перевод введённого текста (кнопка «RU→ZH») ----------
+
+    /** Вызывается службой ввода: курсор в поле ввода другого приложения (true) или нет. */
+    fun setInputActive(active: Boolean) {
+        handler.post { inputActive = active; updateInputButton() }
+    }
+
+    /** Языки для ввода: с языка перевода (обычно русский) на язык оригинала. */
+    private fun inputLangs(): Pair<String, String> {
+        val configured = sourceCodes[prefs.getInt("source", 0).coerceIn(sourceCodes.indices)]
+        val to = if (configured == "auto") prefs.getString("last_source", "zh") ?: "zh" else configured
+        val from = targetCodes[prefs.getInt("target", 0).coerceIn(targetCodes.indices)]
+        return from to to
+    }
+
+    private fun updateInputButton() {
+        if (!::wm.isInitialized) return
+        val show = inputActive && !busy && holdRect == null && fallbackWindow == null &&
+            bubble != null && bubble?.visibility == View.VISIBLE
+        if (!show) { inputButton?.visibility = View.GONE; return }
+        val (from, to) = inputLangs()
+        val b = inputButton ?: Button(this).apply {
+            textSize = 12f
+            minWidth = 0; minimumWidth = 0
+            minHeight = 0; minimumHeight = 0
+            setPadding(dp(8f).toInt(), dp(4f).toInt(), dp(8f).toInt(), dp(4f).toInt())
+            setOnClickListener { translateInput() }
+        }.also { btn ->
+            val ip = params(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT)
+            inputButton = btn; inputParams = ip
+            wm.addView(btn, ip)
+        }
+        if (!inputBusy) b.text = "${from.uppercase()}→${to.uppercase()}"
+        b.visibility = View.VISIBLE
+        positionInputButton()
+    }
+
+    /** Кнопка ввода стоит под TR (или над ним, если внизу нет места). */
+    private fun positionInputButton() {
+        val b = inputButton ?: return
+        val bp = bubbleParams ?: return
+        val ip = inputParams ?: return
+        val side = dp(52f).toInt()
+        val h = dp(40f).toInt()
+        val gap = dp(4f).toInt()
+        ip.x = bp.x
+        ip.y = if (bp.y + side + gap + h < screenSize().y) bp.y + side + gap else bp.y - h - gap
+        try { wm.updateViewLayout(b, ip) } catch (_: Exception) {}
+    }
+
+    private fun translateInput() {
+        if (inputBusy) return
+        val (from, to) = inputLangs()
+        if (from == to) {
+            Toast.makeText(this, "Язык перевода совпадает с языком оригинала — измените язык в настройках", Toast.LENGTH_LONG).show()
+            return
+        }
+        val service = InputAssistService.instance
+        val original = service?.readFocusedText()
+        if (original.isNullOrBlank()) { showFallback("", from, to, null); return }
+        inputBusy = true
+        inputButton?.text = "…"
+        translateText(original, from, to) { result, error ->
+            inputBusy = false
+            updateInputButton()
+            when {
+                result == null -> Toast.makeText(this, "Перевод не получен: ${error ?: "проверьте подключение и модели"}", Toast.LENGTH_LONG).show()
+                InputAssistService.instance?.replaceFocusedText(result) == true -> {}
+                else -> showFallback(original, from, to, result)
+            }
+        }
+    }
+
+    /** Перевод одной строки выбранным переводчиком (ML Kit / Google / Baidu). */
+    private fun translateText(text: String, from: String, to: String, done: (String?, String?) -> Unit) {
+        val provider = prefs.getInt("provider", 0)
+        if (provider == 0) {
+            val translator = try {
+                translators.getOrPut("$from:$to") {
+                    Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(from).setTargetLanguage(to).build())
+                }
+            } catch (e: Exception) { done(null, e.message); return }
+            translator.downloadModelIfNeeded()
+                .addOnSuccessListener {
+                    translator.translate(text)
+                        .addOnSuccessListener { done(it, null) }
+                        .addOnFailureListener { done(null, it.message) }
+                }
+                .addOnFailureListener { done(null, "модель не загружена: ${it.message}") }
+        } else {
+            Thread {
+                var result: String? = null
+                var error: String? = null
+                try {
+                    result = if (provider == 1) googleTranslate(text, from, to) else baiduTranslate(text, from, to)
+                } catch (e: Exception) { error = e.message }
+                handler.post { done(result, error) }
+            }.start()
+        }
+    }
+
+    private fun copyToClipboard(text: String) {
+        val cm = getSystemService(ClipboardManager::class.java)
+        cm.setPrimaryClip(ClipData.newPlainText("translation", text))
+    }
+
+    private fun dismissFallback() {
+        fallbackWindow?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        fallbackWindow = null
+    }
+
+    /**
+     * Запасное окно: если поле не дало вставить текст (или оно пустое).
+     * Можно написать или поправить текст, перевести и скопировать перевод в буфер обмена.
+     */
+    private fun showFallback(original: String, from: String, to: String, result: String?) {
+        dismissFallback()
+        val pad = dp(10f).toInt()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Color.WHITE)
+        }
+        root.addView(TextView(this).apply {
+            text = "Перевод ввода ${from.uppercase()} → ${to.uppercase()}"
+            setTextColor(Color.DKGRAY); textSize = 13f
+        })
+        val input = EditText(this).apply {
+            setText(original)
+            hint = "Введите текст"
+            setTextColor(Color.BLACK); setHintTextColor(Color.GRAY); textSize = 16f
+            maxLines = 4
+        }
+        root.addView(input)
+        val output = TextView(this).apply {
+            setTextColor(Color.BLACK); textSize = 18f
+            setPadding(0, dp(6f).toInt(), 0, dp(6f).toInt())
+            setTextIsSelectable(true)
+        }
+        root.addView(output)
+        val note = TextView(this).apply { setTextColor(Color.rgb(200, 90, 0)); textSize = 12f }
+        root.addView(note)
+        fun setResult(text: String) {
+            output.text = text
+            copyToClipboard(text)
+            note.text = "Скопировано. Вставьте в поле: долгое нажатие → «Вставить»."
+        }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(Button(this).apply {
+            text = "Перевести"
+            setOnClickListener {
+                val t = input.text.toString().trim()
+                if (t.isEmpty()) return@setOnClickListener
+                note.text = "Перевожу…"
+                translateText(t, from, to) { r, e ->
+                    if (r == null) note.text = "Ошибка: ${e ?: "нет перевода"}"
+                    if (r != null) setResult(r)
+                }
+            }
+        })
+        row.addView(Button(this).apply {
+            text = "Копировать"
+            setOnClickListener { if (output.text.isNotEmpty()) setResult(output.text.toString()) }
+        })
+        row.addView(Button(this).apply {
+            text = "✕"
+            setOnClickListener { dismissFallback(); updateInputButton() }
+        })
+        root.addView(row)
+        if (result != null) {
+            setResult(result)
+            note.text = "Поле не дало вставить текст. Перевод скопирован — вставьте его долгим нажатием → «Вставить»."
+        }
+        val s = screenSize()
+        val lp = params((s.x * 0.92f).toInt(), WindowManager.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+            y = dp(70f).toInt()
+            // Окно должно получать фокус, чтобы в нём можно было печатать.
+            flags = flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+        }
+        fallbackWindow = root
+        wm.addView(root, lp)
+        updateInputButton()
+        if (result == null) input.requestFocus()
+    }
+
     override fun onDestroy() {
+        instance = null
+        inputButton?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        dismissFallback()
         holdRunnable?.let { handler.removeCallbacks(it) }
         removeSelectionHint()
         dismissResult()
